@@ -1,9 +1,17 @@
 """日志模块：基于 rich 库提供带颜色的结构化终端日志输出。"""
 
 import logging
+
+from rich.console import Console
 from rich.logging import RichHandler
 
 _FORMAT = "%(name)s - %(message)s"
+_CONSOLE = Console()
+
+
+def get_console() -> Console:
+    """返回日志和交互式终端 UI 共用的 Rich Console。"""
+    return _CONSOLE
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -26,6 +34,7 @@ def get_logger(name: str) -> logging.Logger:
         return logger
 
     handler = RichHandler(
+        console=_CONSOLE,
         rich_tracebacks=True,
         show_path=False,
         log_time_format="[%Y-%m-%d %H:%M:%S]",

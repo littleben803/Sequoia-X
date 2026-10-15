@@ -1,6 +1,6 @@
 [project]
 name = "sequoia-x"
-version = "2.0.0"
+version = "3.0.0"
 requires-python = ">=3.10"
 dependencies = [
     "akshare>=1.10",
@@ -10,6 +10,7 @@ dependencies = [
     "rich>=13.0",
     "pandas>=2.0",
     "requests>=2.31",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,8 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 
 [tool.pytest.ini_options]

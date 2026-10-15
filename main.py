@@ -1,107 +1,208 @@
-"""Sequoia-X V2 主程序入口。
+"""Sequoia-X V3 命令行入口：当前阶段专注可信市场数据底座。"""
 
-两种运行模式：
-  python main.py               # 日常模式：8进程增量补数据 + 跑策略 + 飞书推送（2~3分钟）
-  python main.py --backfill    # 回填模式：baostock 拉全市场历史K线（首次/补数据用，约12分钟）
-"""
+from __future__ import annotations
 
 import argparse
-import sys
-from dotenv import load_dotenv
-load_dotenv()
+import json
+import signal
+import sqlite3
+from datetime import date, timedelta
 
-from datetime import date
-
-import socket
-socket.setdefaulttimeout(10.0)
-
-from sequoia_x.core.config import get_settings
+from sequoia_x.core.config import Settings, get_settings
 from sequoia_x.core.logger import get_logger
-from sequoia_x.data.engine import DataEngine
-from sequoia_x.notify.feishu import FeishuNotifier
-from sequoia_x.strategy.base import BaseStrategy
-from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
-from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
-from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
-from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
-from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
-from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
+from sequoia_x.data.database import MarketDataRepository
+from sequoia_x.data.router import ProviderRouter
+from sequoia_x.data.service import DataApplicationService
+from sequoia_x.reporting.console import DataConsole
+
+logger = get_logger(__name__)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Sequoia-X V3 市场数据与研究工具")
+    legacy = parser.add_mutually_exclusive_group()
+    legacy.add_argument("--backfill", action="store_true", help="兼容命令：等价于 data backfill")
+    legacy.add_argument("--audit", action="store_true", help="兼容命令：等价于 data audit")
+    legacy.add_argument(
+        "--scan-only",
+        action="store_true",
+        help="策略层尚未接入 V3；本参数当前只执行数据审计",
+    )
+
+    commands = parser.add_subparsers(dest="command")
+    data_parser = commands.add_parser("data", help="V3 数据获取、审计与批次查询")
+    data_commands = data_parser.add_subparsers(dest="data_command")
+
+    backfill = data_commands.add_parser("backfill", help="按交易日回填全市场原始盘后数据")
+    backfill.add_argument("--start", help="起始日期 YYYY-MM-DD，默认读取 START_DATE")
+    backfill.add_argument("--end", help="结束日期 YYYY-MM-DD，默认今天")
+
+    sync = data_commands.add_parser("sync", help="增量补齐最近缺失交易日")
+    sync.add_argument("--days", type=int, default=14, help="向前检查的自然日数，默认 14")
+
+    data_commands.add_parser("audit", help="只读审计 V3 数据库")
+    data_commands.add_parser("repair-quality", help="重建证券生命周期、代码别名和缺口状态")
+    data_commands.add_parser("instruments", help="查看证券类型统计")
+    data_commands.add_parser("batches", help="查看最近抓取批次")
+    return parser.parse_args()
+
+
+def _components(settings: Settings) -> tuple[MarketDataRepository, DataApplicationService]:
+    repository = MarketDataRepository(settings.db_path)
+    return repository, DataApplicationService(repository, ProviderRouter())
+
+
+def _run_backfill(
+    settings: Settings,
+    repository: MarketDataRepository,
+    service: DataApplicationService,
+    start_date: str,
+    end_date: str,
+    incremental_quality: bool = False,
+) -> int:
+    date.fromisoformat(start_date)
+    date.fromisoformat(end_date)
+    view = DataConsole()
+    view.show_header(start_date, end_date, settings.db_path)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def handle_sigterm(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    try:
+        report = service.backfill(start_date, end_date, progress_callback=view.update)
+    except KeyboardInterrupt:
+        view.show_interrupted()
+        logger.warning("回填已中断；重新运行原命令即可从未完成交易日续跑")
+        return 130
+    finally:
+        view.stop()
+        signal.signal(signal.SIGTERM, previous_sigterm)
+    if incremental_quality:
+        quality_report = repository.rebuild_data_quality(start_date, end_date)
+        view.show_incremental_quality(quality_report)
+    audit = repository.audit()
+    view.show_summary(report, audit)
+    if report.failed_dates:
+        return 1
+    if report.degraded_dates:
+        logger.warning("任务包含降级部分数据，不代表全品种盘后数据完整")
+    return 0
+
+
+def _print_instruments(repository: MarketDataRepository) -> None:
+    with repository.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT exchange, security_type, COUNT(*) AS count
+            FROM instruments GROUP BY exchange, security_type
+            ORDER BY exchange, security_type
+            """
+        ).fetchall()
+    print(
+        json.dumps(
+            [{"exchange": row[0], "security_type": row[1], "count": row[2]} for row in rows],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def _print_batches(repository: MarketDataRepository) -> None:
+    with repository.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT batch_id, provider, capability, trade_date, status, degraded,
+                   received_count, inserted_count, updated_count, error_message
+            FROM ingestion_batches ORDER BY started_at DESC LIMIT 50
+            """
+        ).fetchall()
+    keys = [
+        "batch_id",
+        "provider",
+        "capability",
+        "trade_date",
+        "status",
+        "degraded",
+        "received_count",
+        "inserted_count",
+        "updated_count",
+        "error_message",
+    ]
+    print(
+        json.dumps(
+            [dict(zip(keys, row, strict=True)) for row in rows], ensure_ascii=False, indent=2
+        )
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sequoia-X V2 选股系统")
-    parser.add_argument(
-        "--backfill",
-        action="store_true",
-        help="回填模式：通过 baostock 拉取全市场历史 K 线（约12分钟）",
-    )
-    args = parser.parse_args()
-
+    args = _parse_args()
     try:
-        # 1. 初始化配置
         settings = get_settings()
-
-        # 2. 初始化日志
-        logger = get_logger(__name__)
-        logger.info("Sequoia-X V2 启动")
-
-        # 3. 初始化数据引擎
-        engine = DataEngine(settings)
-
+        repository, service = _components(settings)
+        today = date.today()
+        latest_default_end = today - timedelta(days=1)
         if args.backfill:
-            # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
-            logger.info("进入回填模式...")
-            all_symbols = engine.get_all_symbols()
-            engine.backfill(all_symbols)
-            logger.info("Sequoia-X V2 回填模式运行完成")
-            return
-
-        # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
-        logger.info("开始拉取最新快照...")
-        count = engine.sync_today_bulk()
-        logger.info(f"快照同步完成，写入 {count} 只股票")
-
-        # 4. 策略列表（新增策略在此追加即可）
-        strategies: list[BaseStrategy] = [
-            MaVolumeStrategy(engine=engine, settings=settings),
-            TurtleTradeStrategy(engine=engine, settings=settings),
-            HighTightFlagStrategy(engine=engine, settings=settings),
-            LimitUpShakeoutStrategy(engine=engine, settings=settings),
-            UptrendLimitDownStrategy(engine=engine, settings=settings),
-            RpsBreakoutStrategy(engine=engine, settings=settings),
-            PrivatePlacementStrategy(engine=engine, settings=settings),
-        ]
-
-        notifier = FeishuNotifier(settings)
-
-        # 5. 遍历策略，有结果则推送至对应机器人
-        for strategy in strategies:
-            strategy_name = type(strategy).__name__
-            logger.info(f"执行策略：{strategy_name}")
-
-            selected: list[str] = strategy.run()
-            logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
-
-            if selected:
-                notifier.send(
-                    symbols=selected,
-                    strategy_name=strategy_name,
-                    webhook_key=strategy.webhook_key,
+            raise SystemExit(
+                _run_backfill(
+                    settings,
+                    repository,
+                    service,
+                    settings.start_date,
+                    latest_default_end.isoformat(),
                 )
-            else:
-                logger.info(f"{strategy_name} 无选股结果，跳过推送")
-
+            )
+        if args.audit or args.scan_only:
+            report = repository.audit()
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+            if args.scan_only:
+                logger.warning("策略层尚未接入 V3，本次只完成数据审计，没有输出候选股")
+            raise SystemExit(0 if report.ready_for_a_share_research else 1)
+        if args.command != "data":
+            logger.info("V3 当前阶段只开放数据命令；运行 `python main.py data --help` 查看用法")
+            return
+        if args.data_command == "backfill":
+            start = args.start or settings.start_date
+            end = args.end or latest_default_end.isoformat()
+            raise SystemExit(_run_backfill(settings, repository, service, start, end))
+        if args.data_command == "sync":
+            if args.days < 1:
+                raise ValueError("--days 必须大于 0")
+            start = (today - timedelta(days=args.days)).isoformat()
+            raise SystemExit(
+                _run_backfill(
+                    settings,
+                    repository,
+                    service,
+                    start,
+                    latest_default_end.isoformat(),
+                    incremental_quality=True,
+                )
+            )
+        if args.data_command == "audit":
+            print(json.dumps(repository.audit().to_dict(), ensure_ascii=False, indent=2))
+            return
+        if args.data_command == "repair-quality":
+            report = repository.rebuild_data_quality()
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+            raise SystemExit(0 if report.unexplained_gaps_after_repair == 0 else 1)
+        if args.data_command == "instruments":
+            _print_instruments(repository)
+            return
+        if args.data_command == "batches":
+            _print_batches(repository)
+            return
+        logger.info("运行 `python main.py data --help` 查看数据命令")
+    except (ValueError, sqlite3.DatabaseError) as exc:
+        logger.error("请求或本地数据库错误：%s", exc)
+        raise SystemExit(2) from exc
+    except SystemExit:
+        raise
     except Exception:
-        try:
-            _logger = get_logger(__name__)
-            _logger.exception("主流程发生未捕获异常，程序终止")
-        except Exception:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
-
-    logger.info("Sequoia-X V2 运行完成")
+        logger.exception("数据流程失败")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
