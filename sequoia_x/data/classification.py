@@ -3,6 +3,11 @@
 from sequoia_x.data.models import Exchange, SecurityType
 
 
+def sse_security_subtype(stock_type: str) -> str | None:
+    """将上交所官方目录的股票类别映射为研究侧证券子类型。"""
+    return "CDR" if str(stock_type) == "8" else None
+
+
 def exchange_from_tdx(market: str) -> Exchange:
     try:
         return {"sh": Exchange.SSE, "sz": Exchange.SZSE, "bj": Exchange.BSE}[market]

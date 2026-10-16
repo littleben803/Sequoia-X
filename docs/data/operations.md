@@ -39,3 +39,46 @@ uv run python main.py data sync --days 30
 ```
 
 `data repair-quality` 只用于质量规则升级或全历史状态需要重建的场景，不需要每天执行。
+
+## 研究扫描
+
+研究扫描与数据同步分离，避免扫描时隐式联网：
+
+```bash
+# 1. 补齐行情并完成数据审计
+uv run python main.py data sync
+
+# 2. 显式刷新前复权因子（会联网）
+uv run python main.py research factors
+
+# 3. 只读审计研究快照
+uv run python main.py research audit
+
+# 4. 只读扫描并生成 reports/latest.json
+uv run python main.py research scan
+```
+
+也可指定历史研究日或策略：
+
+```bash
+uv run python main.py research audit --date 2026-10-13
+uv run python main.py research scan --date 2026-10-13 --strategy rps
+uv run python main.py research scan --strategy ma_volume --strategy turtle
+```
+
+`research audit` 和 `research scan` 不访问网络。如果 V3 基础审计、统一数据日、
+前复权因子新鲜度或覆盖率不符合要求，命令会以非零状态退出。不会写入新报告覆盖
+上一份成功报告。
+
+默认执行 `ma_volume,turtle,flag,rps`。`shakeout` 和 `limit_down` 必须通过
+`--strategy` 或显式修改 `ENABLED_STRATEGIES` 选择，报告会附带未回测风险说明。
+`private_placement` 尚未迁移，不能通过 V3 CLI 运行。
+
+`research factors` 启动后会输出当前证券、处理进度、成功/失败/不支持数量、
+累计写入因子和耗时。按 `Ctrl+C` 时当前批次会标记为中断，已完成证券的数据保留，
+命令以状态码 `130` 退出。当前因子源不覆盖北交所和中国存托凭证（CDR）；二者
+计入“不支持”并安全跳过，不计为刷新失败。
+
+`research scan` 启动后会输出配置解析、研究快照构建、逐策略计算、报告写入四个
+阶段。最终 Summary 会列出统一数据日期、QFQ 覆盖率、排除数量、各策略入选数量、
+去重候选数量、耗时和实际报告路径。

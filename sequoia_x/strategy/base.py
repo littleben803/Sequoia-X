@@ -1,42 +1,50 @@
-"""策略基类模块：定义所有选股策略的抽象接口。"""
+"""V3 策略契约：只消费不可变研究快照，不访问数据库或网络。"""
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
-from sequoia_x.core.config import Settings
-from sequoia_x.data.engine import DataEngine
+from sequoia_x.data.research import ResearchSnapshot
+
+
+@dataclass(frozen=True)
+class StrategyResult:
+    strategy_key: str
+    as_of_date: str
+    selected_instruments: tuple[str, ...]
+    rule_basis: tuple[str, ...]
+    input_instruments: int
+    eligible_instruments: int
+    data_exclusions: int
+    calculation_errors: tuple[str, ...] = ()
+    risk_note: str | None = None
 
 
 class BaseStrategy(ABC):
-    """选股策略抽象基类。
-
-    所有具体策略必须继承此类并实现 run() 方法。
-
-    Attributes:
-        webhook_key: 策略对应的飞书 webhook 标识，用于路由到不同机器人。
-            默认为 'default'，将使用 Settings.feishu_webhook_url。
-            子类可覆盖此属性以路由到专属机器人，例如 'ma_volume'。
-    """
+    """选股策略抽象基类。"""
 
     webhook_key: str = "default"
-
-    def __init__(self, engine: DataEngine, settings: Settings) -> None:
-        """
-        初始化策略。
-
-        Args:
-            engine: DataEngine 实例，用于读取行情数据。
-            settings: Settings 实例，用于读取配置。
-        """
-        self.engine = engine
-        self.settings = settings
+    strategy_key: str = "default"
+    rule_basis: tuple[str, ...] = ()
+    risk_note: str | None = None
 
     @abstractmethod
-    def run(self) -> list[str]:
-        """
-        执行选股逻辑，返回选中的股票代码列表。
-
-        Returns:
-            满足策略条件的股票代码列表，如 ['000001', '600519']。
-            无选股结果时返回空列表。
-        """
+    def run(self, snapshot: ResearchSnapshot) -> StrategyResult:
         ...
+
+    def _result(
+        self,
+        snapshot: ResearchSnapshot,
+        selected: list[str],
+        errors: list[str] | None = None,
+    ) -> StrategyResult:
+        return StrategyResult(
+            strategy_key=self.strategy_key,
+            as_of_date=snapshot.as_of_date,
+            selected_instruments=tuple(sorted(selected)),
+            rule_basis=self.rule_basis,
+            input_instruments=snapshot.requested_instruments,
+            eligible_instruments=snapshot.eligible_instruments,
+            data_exclusions=len(snapshot.exclusions),
+            calculation_errors=tuple(errors or ()),
+            risk_note=self.risk_note,
+        )

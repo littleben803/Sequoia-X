@@ -93,6 +93,21 @@ class DailyBar:
 
 
 @dataclass(frozen=True)
+class AdjustmentFactorRecord:
+    """可审计的复权因子记录。
+
+    QFQ 因子是除数：前复权价 = 原始价 / factor。
+    """
+
+    instrument_id: str
+    effective_date: str
+    factor: float
+    kind: Adjustment
+    provider: str
+    raw_payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class DailySnapshotResult:
     trade_date: str
     provider: str

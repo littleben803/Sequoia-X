@@ -6,14 +6,26 @@ import argparse
 import json
 import signal
 import sqlite3
+import time
 from datetime import date, timedelta
 
 from sequoia_x.core.config import Settings, get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.database import MarketDataRepository
+from sequoia_x.data.research import (
+    AdjustmentFactorService,
+    ResearchDataError,
+    ResearchDataService,
+)
 from sequoia_x.data.router import ProviderRouter
 from sequoia_x.data.service import DataApplicationService
-from sequoia_x.reporting.console import DataConsole
+from sequoia_x.reporting.console import (
+    AdjustmentFactorConsole,
+    DataConsole,
+    ResearchScanConsole,
+)
+from sequoia_x.reporting.local import write_research_report
+from sequoia_x.strategy import STRATEGY_TYPES, create_strategy
 
 logger = get_logger(__name__)
 
@@ -26,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
     legacy.add_argument(
         "--scan-only",
         action="store_true",
-        help="策略层尚未接入 V3；本参数当前只执行数据审计",
+        help="兼容命令：使用 V3 研究快照执行默认策略扫描",
     )
 
     commands = parser.add_subparsers(dest="command")
@@ -44,6 +56,22 @@ def _parse_args() -> argparse.Namespace:
     data_commands.add_parser("repair-quality", help="重建证券生命周期、代码别名和缺口状态")
     data_commands.add_parser("instruments", help="查看证券类型统计")
     data_commands.add_parser("batches", help="查看最近抓取批次")
+
+    research_parser = commands.add_parser("research", help="V3 研究数据与选股扫描")
+    research_commands = research_parser.add_subparsers(dest="research_command")
+    factors = research_commands.add_parser("factors", help="显式刷新沪深 A 股前复权因子")
+    factors.add_argument("--date", help="因子证据日 YYYY-MM-DD，默认最新完整交易日")
+    research_audit = research_commands.add_parser("audit", help="只读审计研究快照")
+    research_audit.add_argument("--date", help="研究日 YYYY-MM-DD")
+    scan = research_commands.add_parser("scan", help="运行 V3 本地选股扫描")
+    scan.add_argument("--date", help="研究日 YYYY-MM-DD")
+    scan.add_argument(
+        "--strategy",
+        action="append",
+        choices=sorted(STRATEGY_TYPES),
+        help="显式选择策略，可重复；默认读取 ENABLED_STRATEGIES",
+    )
+    scan.add_argument("--output", default="reports/latest.json", help="本地 JSON 报告路径")
     return parser.parse_args()
 
 
@@ -137,6 +165,114 @@ def _print_batches(repository: MarketDataRepository) -> None:
     )
 
 
+def _strategy_keys(settings: Settings, requested: list[str] | None) -> tuple[str, ...]:
+    raw_keys = requested or [
+        key.strip().lower() for key in settings.enabled_strategies.split(",") if key.strip()
+    ]
+    keys = tuple(dict.fromkeys(raw_keys))
+    unknown = sorted(set(keys) - set(STRATEGY_TYPES))
+    if unknown:
+        raise ValueError(f"未知或尚未迁移的策略：{', '.join(unknown)}")
+    if not keys:
+        raise ValueError("至少需要启用一个已迁移策略")
+    return keys
+
+
+def _run_research_audit(
+    settings: Settings,
+    repository: MarketDataRepository,
+    as_of_date: str | None,
+) -> int:
+    if as_of_date:
+        date.fromisoformat(as_of_date)
+    report = ResearchDataService(repository).audit_snapshot(
+        history_bars=121,
+        as_of_date=as_of_date,
+        minimum_coverage=settings.minimum_latest_coverage,
+    )
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    return 0 if report.ready else 1
+
+
+def _run_factor_refresh(
+    repository: MarketDataRepository,
+    router: ProviderRouter,
+    as_of_date: str | None,
+) -> int:
+    target_date = as_of_date or repository.latest_complete_snapshot_date()
+    if target_date is None:
+        raise ResearchDataError("没有完整交易日，无法确定复权因子证据日")
+    date.fromisoformat(target_date)
+    if not repository.has_complete_snapshot(target_date):
+        raise ResearchDataError(f"因子证据日 {target_date} 没有完整全市场批次")
+    view = AdjustmentFactorConsole()
+    view.show_header(target_date, repository.db_path, router.primary.provider_name)
+    try:
+        report = AdjustmentFactorService(repository, router.primary).refresh_qfq(
+            target_date,
+            progress_callback=view.update,
+        )
+    except KeyboardInterrupt:
+        view.show_interrupted()
+        return 130
+    view.show_summary(report)
+    return 0 if report.failed_instruments == 0 else 1
+
+
+def _run_research_scan(
+    settings: Settings,
+    repository: MarketDataRepository,
+    *,
+    as_of_date: str | None,
+    requested_strategies: list[str] | None,
+    output_path: str,
+) -> int:
+    started = time.monotonic()
+    if as_of_date:
+        date.fromisoformat(as_of_date)
+    keys = _strategy_keys(settings, requested_strategies)
+    history_bars = 121
+    view = ResearchScanConsole()
+    view.show_header(
+        requested_date=as_of_date,
+        db_path=repository.db_path,
+        strategies=keys,
+        output_path=output_path,
+        history_bars=history_bars,
+    )
+    try:
+        snapshot = ResearchDataService(repository).build_snapshot(
+            history_bars=history_bars,
+            as_of_date=as_of_date,
+            minimum_coverage=settings.minimum_latest_coverage,
+            progress_callback=view.update_snapshot,
+        )
+        view.show_strategy_phase(len(keys))
+        collected_results = []
+        for index, key in enumerate(keys, 1):
+            view.show_strategy_start(index, len(keys), key)
+            result = create_strategy(key).run(snapshot)
+            collected_results.append(result)
+            view.show_strategy_result(result)
+        results = tuple(collected_results)
+        view.show_report_phase(output_path)
+        report_path = write_research_report(
+            snapshot=snapshot,
+            results=results,
+            output_path=output_path,
+        )
+    except Exception as error:
+        view.show_failure(str(error))
+        raise
+    view.show_summary(
+        snapshot=snapshot,
+        results=results,
+        report_path=report_path,
+        elapsed_seconds=time.monotonic() - started,
+    )
+    return 0
+
+
 def main() -> None:
     args = _parse_args()
     try:
@@ -154,14 +290,39 @@ def main() -> None:
                     latest_default_end.isoformat(),
                 )
             )
-        if args.audit or args.scan_only:
+        if args.audit:
             report = repository.audit()
             print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
-            if args.scan_only:
-                logger.warning("策略层尚未接入 V3，本次只完成数据审计，没有输出候选股")
             raise SystemExit(0 if report.ready_for_a_share_research else 1)
+        if args.scan_only:
+            raise SystemExit(
+                _run_research_scan(
+                    settings,
+                    repository,
+                    as_of_date=None,
+                    requested_strategies=None,
+                    output_path="reports/latest.json",
+                )
+            )
+        if args.command == "research":
+            if args.research_command == "factors":
+                raise SystemExit(_run_factor_refresh(repository, service.router, args.date))
+            if args.research_command == "audit":
+                raise SystemExit(_run_research_audit(settings, repository, args.date))
+            if args.research_command == "scan":
+                raise SystemExit(
+                    _run_research_scan(
+                        settings,
+                        repository,
+                        as_of_date=args.date,
+                        requested_strategies=args.strategy,
+                        output_path=args.output,
+                    )
+                )
+            logger.info("`python main.py research --help` 查看研究命令")
+            return
         if args.command != "data":
-            logger.info("V3 当前阶段只开放数据命令；运行 `python main.py data --help` 查看用法")
+            logger.info("`python main.py --help` 查看数据与研究命令")
             return
         if args.data_command == "backfill":
             start = args.start or settings.start_date
@@ -198,6 +359,9 @@ def main() -> None:
     except (ValueError, sqlite3.DatabaseError) as exc:
         logger.error("请求或本地数据库错误：%s", exc)
         raise SystemExit(2) from exc
+    except ResearchDataError as exc:
+        logger.error("研究质量闸门未通过：%s", exc)
+        raise SystemExit(1) from exc
     except SystemExit:
         raise
     except Exception:

@@ -136,6 +136,17 @@ def test_calendar_persists_closed_days_but_plans_only_open_days(tmp_path: Path) 
     assert repository.trading_dates("2026-10-11", "2026-10-12") == ("2026-10-12",)
 
 
+def test_latest_complete_snapshot_date_does_not_require_full_audit(tmp_path: Path) -> None:
+    repository = MarketDataRepository(str(tmp_path / "v3.db"))
+    older = repository.start_batch("test", "DAILY_SNAPSHOT", "2026-10-12")
+    newer = repository.start_batch("test", "DAILY_SNAPSHOT", "2026-10-13")
+    with repository.connect() as conn:
+        conn.execute("UPDATE ingestion_batches SET status='COMPLETE' WHERE batch_id=?", (older,))
+        conn.execute("UPDATE ingestion_batches SET status='FAILED' WHERE batch_id=?", (newer,))
+
+    assert repository.latest_complete_snapshot_date() == "2026-10-12"
+
+
 def test_v3_schema_does_not_create_v2_stock_daily_table(tmp_path: Path) -> None:
     path = tmp_path / "v3.db"
     MarketDataRepository(str(path))
@@ -330,3 +341,62 @@ def test_quality_repair_maps_bse_code_migration_and_closes_lifecycle_gaps(
             "WHERE trade_date='2025-09-30' AND status_source='range-isolation-test'"
         ).fetchone()[0]
     assert preserved == 1
+
+
+def test_quality_repair_uses_raw_bar_bounds_when_canonical_bar_is_absent(
+    tmp_path: Path,
+) -> None:
+    repository = MarketDataRepository(str(tmp_path / "v3.db"))
+    delisted = InstrumentRecord(
+        Exchange.SSE,
+        "600290",
+        "退市测试",
+        SecurityType.STOCK,
+        source="a-stock-data",
+    )
+    repository.save_calendar(
+        (
+            TradeCalendarDay("2024-01-15", True, provider="test"),
+            TradeCalendarDay("2026-10-14", True, provider="test"),
+        )
+    )
+    zero_trade_bar = DailyBar(
+        instrument_id=delisted.instrument_id,
+        trade_date="2024-01-15",
+        open=0,
+        high=0,
+        low=0,
+        close=1,
+        previous_close=1,
+        volume=0,
+        amount=0,
+        provider="a-stock-data",
+    )
+    for trade_date, bars, instruments in (
+        ("2024-01-15", (zero_trade_bar,), (delisted,)),
+        ("2026-10-14", (), ()),
+    ):
+        snapshot = DailySnapshotResult(
+            trade_date,
+            "a-stock-data",
+            "test://package",
+            bars,
+            instruments,
+            "checksum",
+        )
+        batch = repository.start_batch("a-stock-data", "DAILY_SNAPSHOT", trade_date)
+        repository.save_snapshot(batch, snapshot)
+
+    repository.rebuild_data_quality()
+
+    with repository.connect() as conn:
+        lifecycle = conn.execute(
+            "SELECT listing_status, code_valid_from, code_valid_to "
+            "FROM instruments WHERE instrument_id='SSE:600290'"
+        ).fetchone()
+        future_statuses = conn.execute(
+            "SELECT COUNT(*) FROM instrument_daily_status "
+            "WHERE instrument_id='SSE:600290' AND trade_date>'2024-01-15'"
+        ).fetchone()[0]
+    assert lifecycle == ("DELISTED", "2024-01-15", "2024-01-15")
+    assert future_statuses == 0

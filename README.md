@@ -16,9 +16,10 @@ Sequoia-X V3 当前优先建设可信数据底座：按交易日下载通达信�
 - `BaostockProvider`：沪深 A 股主数据增强、日线和停牌状态降级。
 - V3 多资产证券主数据、原始行情、canonical 行情、批次证据和质量审计。
 - 按交易日回填、增量、断点续跑以及彩色终端进度。
+- V3 A 股研究快照层：统一数据日、前复权因子证据、覆盖率闸门和明确排除原因。
 
-策略代码仍保留，但尚未切换到 V3 数据。普通启动和 `--scan-only` 不会输出候选股，避免
-把旧后复权模型误用到新的原始行情。下一阶段将建立 A 股研究视图后再接回策略。
+默认四个策略已切换到 V3 研究快照。扫描只读本地数据，质量闸门或复权因子
+覆盖不足时会停止，不会静默输出部分候选股。
 
 ## 安装
 
@@ -65,6 +66,34 @@ uv run python main.py --audit
 
 详细运行说明见 [V3 数据运行手册](docs/data/operations.md)。
 
+## 研究命令
+
+```bash
+# 数据同步后，显式联网刷新沪深 A 股前复权因子
+uv run python main.py research factors
+
+# 只读检查研究日、因子覆盖和排除原因
+uv run python main.py research audit
+
+# 运行默认四个策略，原子写入 reports/latest.json
+uv run python main.py research scan
+
+# 显式运行单个策略；高风险策略只能这样显式选择
+uv run python main.py research scan --strategy rps
+uv run python main.py research scan --strategy shakeout
+
+# 旧参数等价于默认策略扫描
+uv run python main.py --scan-only
+```
+
+`research scan` 本身不访问网络。`research factors` 会对沪深证券逐只请求因子，
+耗时取决于证券数量和源站状态。终端会实时显示当前证券、成功/失败/不支持数量、
+累计写入量和耗时。当前因子源不覆盖北交所和中国存托凭证（CDR）；这些证券会
+明确计入“不支持”，不会伪造因子或导致刷新失败，并从 QFQ 研究股票池排除。
+
+`research scan` 会依次展示扫描配置、可信研究快照构建、逐策略计算和报告写入四个
+阶段；完成后输出数据日期、覆盖率、各策略入选数量、去重候选数量和报告路径 Summary。
+
 ## 数据源与降级
 
 主路径每个交易日只下载一个通达信盘后包。包内三市场数据必须通过文件存在、块长度、
@@ -88,6 +117,7 @@ Baostock 只用于证券目录降级和无成交状态确认，不能把 A 股�
 - 每次下载记录在 `ingestion_batches`，包括状态、来源 URL、校验和、数量和错误。
 
 数据库说明见 [V3 Schema](docs/architecture/database-schema-v3.md)。
+研究快照的质量和复权边界见 [V3 研究数据层](docs/architecture/research-data-layer-v3.md)。
 
 ## 文档与上游归档
 
@@ -97,16 +127,16 @@ Baostock 只用于证券目录降级和无成交状态确认，不能把 A 股�
 - [a-stock-data 能力目录](docs/data/a-stock-data-capability-catalog.md)
 - [归档的 a-stock-data v3.10.2 SKILL.md](docs/vendor/a-stock-data/v3.10.2/SKILL.md)
 
-## 内置策略（暂未接入 V3）
+## 内置策略
 
 | 策略 | 说明 | 规划状态 |
 |---|---|---|
-| MaVolume | 5/20 日均线金叉 + 放量 | 下一阶段接入 |
-| TurtleTrade | 20 日新高 + 成交额 + 阳线过滤 | 下一阶段接入 |
-| HighTightFlag | 强动量后高位收敛缩量 | 下一阶段接入 |
-| RpsBreakout | 120 日相对强度突破 | 下一阶段接入 |
-| LimitUpShakeout | 涨停后洗盘形态 | 禁用，待回测 |
-| UptrendLimitDown | 上升趋势中的放量跌停 | 禁用，待回测 |
+| MaVolume | 5/20 日均线金叉 + 放量 | V3 默认启用 |
+| TurtleTrade | 20 日新高 + 成交额 + 阳线过滤 | V3 默认启用 |
+| HighTightFlag | 强动量后高位收敛缩量 | V3 默认启用 |
+| RpsBreakout | 120 日相对强度突破 | V3 默认启用 |
+| LimitUpShakeout | 涨停后洗盘形态 | 已迁移，默认禁用，待独立回测 |
+| UptrendLimitDown | 上升趋势中的放量跌停 | 已迁移，默认禁用，待独立回测 |
 | PrivatePlacement | 最近定增事件监控 | 禁用，待回测 |
 
 ## 验证
@@ -117,6 +147,7 @@ uv run ruff check .
 uv run python -m compileall -q main.py sequoia_x
 uv run python main.py --help
 uv run python main.py data --help
+uv run python main.py research --help
 git diff --check
 git status --short
 ```

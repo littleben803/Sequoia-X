@@ -1,5 +1,7 @@
 """终端展示层：数据层只发送结构化事件，不依赖 Rich。"""
 
+from pathlib import Path
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeElapsedColumn
@@ -13,6 +15,13 @@ from sequoia_x.data.models import (
     QualityRepairReport,
     V3AuditReport,
 )
+from sequoia_x.data.research import (
+    AdjustmentFactorProgress,
+    AdjustmentFactorRefreshReport,
+    ResearchSnapshot,
+    ResearchSnapshotProgress,
+)
+from sequoia_x.strategy.base import StrategyResult
 
 
 class BackfillConsole:
@@ -302,3 +311,232 @@ class DataConsole:
         self.console.print(table)
         for error in report.errors[-10:]:
             self.console.print(f"[yellow]⚠️ {error}[/yellow]")
+
+
+class AdjustmentFactorConsole:
+    """V3 前复权因子刷新终端视图。"""
+
+    def __init__(self, console: Console | None = None) -> None:
+        self.console = console or get_console()
+        self._progress: Progress | None = None
+        self._task_id: int | None = None
+
+    def show_header(self, as_of_date: str, db_path: str, provider: str) -> None:
+        self.console.print()
+        self.console.print(
+            Panel.fit(
+                "[bold green]🌲 Sequoia-X V3 前复权因子刷新[/bold green]\n"
+                f"证据日：[cyan]{as_of_date}[/cyan]  "
+                f"Provider：[cyan]{provider}[/cyan]\n"
+                f"数据库：[cyan]{db_path}[/cyan]  口径：[cyan]QFQ[/cyan]",
+                border_style="green",
+            )
+        )
+        self.console.rule("[bold cyan]📋 阶段 1/2 · 准备研究日 A 股列表[/bold cyan]")
+
+    def update(self, event: AdjustmentFactorProgress) -> None:
+        if event.phase == "PREPARING":
+            self.console.print(f"[green]✅ {event.message}[/green]")
+            self._start(event.requested_instruments)
+            return
+        if event.phase == "INTERRUPTED":
+            self.stop()
+            self.console.print(f"[bold yellow]⏸️ {event.message}[/bold yellow]")
+            return
+        if event.phase == "COMPLETE":
+            if self._progress is not None and self._task_id is not None:
+                self._progress.update(
+                    self._task_id,
+                    completed=event.processed_instruments,
+                    description="前复权因子刷新完成",
+                    refresh=True,
+                )
+            return
+        if self._progress is None:
+            self._start(event.requested_instruments)
+        assert self._progress is not None and self._task_id is not None
+        identity = event.current_instrument_id or "-"
+        if event.current_name:
+            identity = f"{event.current_name}（{identity}）"
+        self._progress.update(
+            self._task_id,
+            total=event.requested_instruments,
+            completed=event.processed_instruments,
+            description=(
+                f"{identity} · {event.message} "
+                f"[green]✅ {event.successful_instruments}[/green] "
+                f"[yellow]↪️ 不支持 {event.unsupported_instruments}[/yellow] "
+                f"[red]❌ {event.failed_instruments}[/red] "
+                f"[cyan]💾 {event.factor_rows_written:,}[/cyan]"
+            ),
+            refresh=True,
+        )
+
+    def _start(self, total: int) -> None:
+        if self._progress is not None:
+            return
+        self.console.rule("[bold cyan]🔄 阶段 2/2 · 逐证券请求、校验并保存 QFQ 因子[/bold cyan]")
+        self._progress = Progress(
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=None),
+            TaskProgressColumn(),
+            TextColumn("{task.completed:,.0f}/{task.total:,.0f}"),
+            TimeElapsedColumn(),
+            console=self.console,
+            expand=True,
+        )
+        self._progress.start()
+        self._task_id = self._progress.add_task("正在准备因子任务", total=total)
+
+    def stop(self) -> None:
+        if self._progress:
+            self._progress.stop()
+        self._progress = None
+        self._task_id = None
+
+    def show_interrupted(self) -> None:
+        self.stop()
+        self.console.print(
+            Panel.fit(
+                "[bold yellow]⏸️ 前复权因子刷新已安全停止[/bold yellow]\n"
+                "已完成的证券因子保留；重新运行会幂等更新。",
+                border_style="yellow",
+            )
+        )
+
+    def show_summary(self, report: AdjustmentFactorRefreshReport) -> None:
+        self.stop()
+        table = Table(title="📊 QFQ 因子刷新 Summary", border_style="cyan", show_header=False)
+        table.add_column("项目", style="bold")
+        table.add_column("结果", justify="right")
+        table.add_row("证据日", report.as_of_date)
+        table.add_row("请求证券", f"{report.requested_instruments:,}")
+        table.add_row("成功", f"[green]{report.successful_instruments:,}[/green]")
+        table.add_row("当前源不支持", f"[yellow]{report.unsupported_instruments:,}[/yellow]")
+        table.add_row("失败", f"[red]{report.failed_instruments:,}[/red]")
+        table.add_row("写入/更新因子", f"{report.factor_rows_written:,}")
+        table.add_row("耗时", f"{report.elapsed_seconds:.1f}s")
+        status = (
+            "[green]✅ 完成[/green]"
+            if report.failed_instruments == 0
+            else "[yellow]⚠️ 完成但存在失败[/yellow]"
+        )
+        table.add_row("状态", status)
+        self.console.print(table)
+        failed_details = [
+            item for item in report.failures if "UNSUPPORTED_FACTOR_SOURCE" not in item
+        ]
+        for error in failed_details[-10:]:
+            self.console.print(f"[red]❌ {error}[/red]")
+
+
+class ResearchScanConsole:
+    """V3 本地选股扫描终端视图。"""
+
+    def __init__(self, console: Console | None = None) -> None:
+        self.console = console or get_console()
+
+    def show_header(
+        self,
+        *,
+        requested_date: str | None,
+        db_path: str,
+        strategies: tuple[str, ...],
+        output_path: str,
+        history_bars: int,
+    ) -> None:
+        date_text = requested_date or "自动选择最新完整交易日"
+        self.console.print()
+        self.console.print(
+            Panel.fit(
+                "[bold green]🌲 Sequoia-X V3 本地选股扫描[/bold green]\n"
+                f"研究日：[cyan]{date_text}[/cyan]  口径：[cyan]QFQ[/cyan]\n"
+                f"策略：[cyan]{', '.join(strategies)}[/cyan]  "
+                f"历史窗口：[cyan]{history_bars}[/cyan]\n"
+                f"数据库：[cyan]{db_path}[/cyan]\n"
+                f"报告：[cyan]{output_path}[/cyan]",
+                border_style="green",
+            )
+        )
+        self.console.rule("[bold cyan]📋 阶段 1/4 · 解析扫描配置[/bold cyan]")
+        self.console.print(
+            f"[green]✅ 已启用 {len(strategies)} 个策略；扫描只读取本地数据[/green]"
+        )
+        self.console.rule("[bold cyan]🧪 阶段 2/4 · 构建可信研究快照[/bold cyan]")
+
+    def update_snapshot(self, event: ResearchSnapshotProgress) -> None:
+        marker = "✅" if event.phase in {"DATE_RESOLVED", "READY"} else "🔄"
+        color = "green" if event.phase in {"DATE_RESOLVED", "READY"} else "cyan"
+        detail = ""
+        if event.phase == "READY":
+            detail = (
+                f" · 请求 {event.requested_instruments:,}"
+                f" · 可用 {event.eligible_instruments:,}"
+                f" · 排除 {event.excluded_instruments:,}"
+                f" · 覆盖率 {event.coverage:.2%}"
+            )
+        self.console.print(f"[{color}]{marker} {event.message}{detail}[/{color}]")
+
+    def show_strategy_phase(self, total: int) -> None:
+        self.console.rule(f"[bold cyan]🎯 阶段 3/4 · 依次执行 {total} 个选股策略[/bold cyan]")
+
+    def show_strategy_start(self, index: int, total: int, strategy_key: str) -> None:
+        self.console.print(
+            f"[cyan]🔄 策略 {index}/{total} · {strategy_key} · 正在计算[/cyan]"
+        )
+
+    def show_strategy_result(self, result: StrategyResult) -> None:
+        error_text = (
+            f" · [yellow]计算异常 {len(result.calculation_errors):,}[/yellow]"
+            if result.calculation_errors
+            else ""
+        )
+        self.console.print(
+            f"[green]✅ {result.strategy_key} 完成[/green]"
+            f" · 输入 {result.input_instruments:,}"
+            f" · 有效 {result.eligible_instruments:,}"
+            f" · 入选 [bold cyan]{len(result.selected_instruments):,}[/bold cyan]"
+            f"{error_text}"
+        )
+        if result.risk_note:
+            self.console.print(f"[yellow]⚠️ {result.strategy_key}：{result.risk_note}[/yellow]")
+
+    def show_report_phase(self, output_path: str) -> None:
+        self.console.rule("[bold cyan]💾 阶段 4/4 · 写入本地研究报告[/bold cyan]")
+        self.console.print(f"[cyan]🔄 正在原子写入 {output_path}[/cyan]")
+
+    def show_failure(self, message: str) -> None:
+        self.console.print(f"[bold red]❌ 扫描停止：{message}[/bold red]")
+
+    def show_summary(
+        self,
+        *,
+        snapshot: ResearchSnapshot,
+        results: tuple[StrategyResult, ...],
+        report_path: Path,
+        elapsed_seconds: float,
+    ) -> None:
+        unique_selected = set().union(
+            *(result.selected_instruments for result in results)
+        )
+        table = Table(title="📊 Research Scan Summary", border_style="cyan", show_header=False)
+        table.add_column("项目", style="bold")
+        table.add_column("结果", justify="right")
+        table.add_row("数据日期", snapshot.as_of_date)
+        table.add_row("价格口径", snapshot.price_adjustment)
+        table.add_row("请求证券", f"{snapshot.requested_instruments:,}")
+        table.add_row("有效证券", f"[green]{snapshot.eligible_instruments:,}[/green]")
+        table.add_row("数据排除", f"[yellow]{len(snapshot.exclusions):,}[/yellow]")
+        table.add_row("覆盖率", f"{snapshot.coverage:.2%}")
+        for result in results:
+            table.add_row(
+                f"策略 {result.strategy_key}",
+                f"[cyan]入选 {len(result.selected_instruments):,}[/cyan]",
+            )
+        table.add_row("去重候选", f"[bold cyan]{len(unique_selected):,}[/bold cyan]")
+        table.add_row("报告路径", str(report_path))
+        table.add_row("耗时", f"{elapsed_seconds:.1f}s")
+        table.add_row("状态", "[green]✅ 完成[/green]")
+        self.console.print("[green]✅ 研究报告已安全写入[/green]")
+        self.console.print(table)
+        self.console.print("[dim]仅用于个人研究，不构成投资建议或收益保证。[/dim]")

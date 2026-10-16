@@ -20,7 +20,11 @@ from typing import Any
 import pandas as pd
 import requests
 
-from sequoia_x.data.classification import classify_security, exchange_from_tdx
+from sequoia_x.data.classification import (
+    classify_security,
+    exchange_from_tdx,
+    sse_security_subtype,
+)
 from sequoia_x.data.errors import DataIntegrityError, DataNotAvailableError, DataProviderError
 from sequoia_x.data.models import (
     Adjustment,
@@ -344,6 +348,7 @@ class AStockDataProvider:
                     security_code=code,
                     name=name,
                     security_type=SecurityType.STOCK,
+                    security_subtype=sse_security_subtype(stock_type),
                     list_date=_optional_iso_day(row.get("LIST_DATE")),
                     listing_status="LISTED",
                     source="sse-official",

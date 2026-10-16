@@ -1,61 +1,55 @@
-import sqlite3
+"""RPS 极强动量突破策略。"""
 
-import pandas as pd
-
-from sequoia_x.core.logger import get_logger
-from sequoia_x.strategy.base import BaseStrategy
-
-logger = get_logger(__name__)
+from sequoia_x.data.research import ResearchSnapshot
+from sequoia_x.strategy.base import BaseStrategy, StrategyResult
 
 
 class RpsBreakoutStrategy(BaseStrategy):
     """RPS 极强动量突破策略"""
 
     webhook_key: str = "rps"
+    strategy_key: str = "rps"
     rps_period: int = 120
     rps_threshold: int = 90
+    rule_basis = (
+        "120个交易日涨幅的横截面百分位不低于90",
+        "当日收盘价不低于近120日最高价的90%",
+    )
 
-    def run(self) -> list[str]:
-        try:
-            with sqlite3.connect(self.engine.db_path) as conn:
-                df = pd.read_sql("SELECT symbol, date, close, high FROM stock_daily", conn)
-        except Exception as exc:
-            logger.error(f"读取数据库失败: {exc}")
-            return []
+    def run(self, snapshot: ResearchSnapshot) -> StrategyResult:
+        returns: dict[str, float] = {}
+        for instrument_id, bars in snapshot.bars.items():
+            if len(bars) < self.rps_period + 1:
+                continue
+            base_close = bars[-(self.rps_period + 1)].close
+            returns[instrument_id] = (bars[-1].close - base_close) / base_close
+        if not returns:
+            return self._result(snapshot, [])
 
-        if df.empty:
-            return []
+        rps = self._percentile_ranks(returns)
+        selected = [
+            instrument_id
+            for instrument_id, percentile in rps.items()
+            if percentile >= self.rps_threshold
+            and snapshot.bars[instrument_id][-1].close
+            >= max(bar.high for bar in snapshot.bars[instrument_id][-self.rps_period :]) * 0.9
+        ]
+        return self._result(snapshot, selected)
 
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values(["symbol", "date"])
-
-        # 纵向计算涨幅
-        df["close_shift"] = df.groupby("symbol")["close"].shift(self.rps_period)
-        df["pct_change"] = (df["close"] - df["close_shift"]) / df["close_shift"]
-
-        latest_date = df["date"].max()
-        latest_df = df[df["date"] == latest_date].copy()
-        latest_df = latest_df.dropna(subset=["pct_change"])
-
-        # 横向排位 (RPS)
-        latest_df["rps"] = latest_df["pct_change"].rank(pct=True) * 100
-        strong_stocks = latest_df[latest_df["rps"] >= self.rps_threshold].copy()
-
-        # 计算滚动最高价
-        roll_high = (
-            df.groupby("symbol")["high"]
-            .rolling(window=self.rps_period, min_periods=self.rps_period // 2)
-            .max()
-            .reset_index(level=0, drop=True)
-        )
-        df["roll_high"] = roll_high
-
-        latest_roll_high = df[df["date"] == latest_date][["symbol", "roll_high"]]
-        strong_stocks = strong_stocks.merge(latest_roll_high, on="symbol")
-
-        # 突破判定
-        breakout_condition = strong_stocks["close"] >= strong_stocks["roll_high"] * 0.90
-        selected = strong_stocks[breakout_condition]
-
-        logger.info(f"RpsBreakoutStrategy 选出 {len(selected)} 只股票")
-        return selected["symbol"].tolist()
+    @staticmethod
+    def _percentile_ranks(values: dict[str, float]) -> dict[str, float]:
+        """与 pandas rank(pct=True) 的平均名次规则一致。"""
+        ordered = sorted(values.items(), key=lambda item: item[1])
+        ranks: dict[str, float] = {}
+        index = 0
+        total = len(ordered)
+        while index < total:
+            end = index + 1
+            while end < total and ordered[end][1] == ordered[index][1]:
+                end += 1
+            average_rank = ((index + 1) + end) / 2
+            percentile = average_rank / total * 100
+            for item_index in range(index, end):
+                ranks[ordered[item_index][0]] = percentile
+            index = end
+        return ranks

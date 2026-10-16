@@ -1,9 +1,9 @@
 """高旗形整理策略：强动量后极度收敛缩量。"""
 
-from sequoia_x.core.logger import get_logger
-from sequoia_x.strategy.base import BaseStrategy
+from statistics import fmean
 
-logger = get_logger(__name__)
+from sequoia_x.data.research import ResearchSnapshot
+from sequoia_x.strategy.base import BaseStrategy, StrategyResult
 
 
 class HighTightFlagStrategy(BaseStrategy):
@@ -19,52 +19,31 @@ class HighTightFlagStrategy(BaseStrategy):
     """
 
     webhook_key: str = "flag"
+    strategy_key: str = "flag"
     _MIN_BARS: int = 40  # 至少需要 40 根 K 线
+    rule_basis = (
+        "过40日最高价/最低价大于1.6",
+        "近10日最高价/最低价小于1.15且位于40日高位",
+        "当日成交量小于前20日均量的0.6倍",
+    )
 
-    def run(self) -> list[str]:
-        """
-        遍历全市场，返回满足高旗形整理条件的股票代码列表。
-
-        Returns:
-            满足条件的股票代码列表。
-        """
-        symbols = self.engine.get_local_symbols()
+    def run(self, snapshot: ResearchSnapshot) -> StrategyResult:
         selected: list[str] = []
-
-        for symbol in symbols:
-            try:
-                df = self.engine.get_ohlcv(symbol)
-                if len(df) < self._MIN_BARS:
-                    continue
-
-                # 向量化计算各窗口指标
-                tail40 = df.tail(40)
-                tail10 = df.tail(10)
-
-                high40 = tail40["high"].max()
-                low40 = tail40["low"].min()
-                high10 = tail10["high"].max()
-                low10 = tail10["low"].min()
-
-                if low40 == 0 or low10 == 0:
-                    continue
-
-                # 条件 1：强动量
-                momentum = high40 / low40 > 1.6
-                # 条件 2：极度收敛
-                consolidation = high10 / low10 < 1.15
-                # 条件 3：高位抗跌（近10天最低点不得低于40天最高点的80%）
-                high_level = low10 >= high40 * 0.8
-                # 条件 4：缩量（向量化均值）
-                vol_ma20 = df["volume"].iloc[-21:-1].mean()
-                shrink = df["volume"].iloc[-1] < vol_ma20 * 0.6
-
-                if momentum and consolidation and high_level and shrink:
-                    selected.append(symbol)
-
-            except Exception as exc:
-                logger.warning(f"[{symbol}] HighTightFlagStrategy 计算失败：{exc}")
+        for instrument_id, bars in snapshot.bars.items():
+            if len(bars) < self._MIN_BARS:
                 continue
-
-        logger.info(f"HighTightFlagStrategy 选出 {len(selected)} 只股票")
-        return selected
+            tail40 = bars[-40:]
+            tail10 = bars[-10:]
+            high40 = max(bar.high for bar in tail40)
+            low40 = min(bar.low for bar in tail40)
+            high10 = max(bar.high for bar in tail10)
+            low10 = min(bar.low for bar in tail10)
+            previous_volume_ma20 = fmean(bar.volume for bar in bars[-21:-1])
+            if (
+                high40 / low40 > 1.6
+                and high10 / low10 < 1.15
+                and low10 >= high40 * 0.8
+                and bars[-1].volume < previous_volume_ma20 * 0.6
+            ):
+                selected.append(instrument_id)
+        return self._result(snapshot, selected)

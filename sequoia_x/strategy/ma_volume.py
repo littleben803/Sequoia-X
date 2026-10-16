@@ -1,9 +1,9 @@
 """均线+成交量选股策略：5日均线上穿20日均线且成交量放大。"""
 
-from sequoia_x.core.logger import get_logger
-from sequoia_x.strategy.base import BaseStrategy
+from statistics import fmean
 
-logger = get_logger(__name__)
+from sequoia_x.data.research import ResearchSnapshot
+from sequoia_x.strategy.base import BaseStrategy, StrategyResult
 
 
 class MaVolumeStrategy(BaseStrategy):
@@ -18,41 +18,27 @@ class MaVolumeStrategy(BaseStrategy):
     """
 
     webhook_key: str = "ma_volume"
+    strategy_key: str = "ma_volume"
+    rule_basis = (
+        "5日收盘均线由下向上穿越20日收盘均线",
+        "当日成交量大于20日均量的1.5倍",
+    )
 
-    def run(self) -> list[str]:
-        """
-        遍历全市场，返回满足均线金叉+放量条件的股票代码列表。
-
-        Returns:
-            满足条件的股票代码列表。
-        """
-        symbols = self.engine.get_local_symbols()
+    def run(self, snapshot: ResearchSnapshot) -> StrategyResult:
         selected: list[str] = []
-
-        for symbol in symbols:
-            try:
-                df = self.engine.get_ohlcv(symbol)
-                if len(df) < 20:
-                    continue
-
-                # 向量化计算均线和成交量均值
-                df["ma5"] = df["close"].rolling(5).mean()
-                df["ma20"] = df["close"].rolling(20).mean()
-                df["vol_ma20"] = df["volume"].rolling(20).mean()
-
-                # 取最后两行判断金叉（昨日 ma5 < ma20，今日 ma5 > ma20）
-                last = df.iloc[-1]
-                prev = df.iloc[-2]
-
-                golden_cross = prev["ma5"] < prev["ma20"] and last["ma5"] > last["ma20"]
-                volume_surge = last["volume"] > last["vol_ma20"] * 1.5
-
-                if golden_cross and volume_surge:
-                    selected.append(symbol)
-
-            except Exception as exc:
-                logger.warning(f"[{symbol}] 策略计算失败：{exc}")
+        for instrument_id, bars in snapshot.bars.items():
+            if len(bars) < 21:
                 continue
-
-        logger.info(f"MaVolumeStrategy 选出 {len(selected)} 只股票")
-        return selected
+            previous = bars[:-1]
+            previous_ma5 = fmean(bar.close for bar in previous[-5:])
+            previous_ma20 = fmean(bar.close for bar in previous[-20:])
+            current_ma5 = fmean(bar.close for bar in bars[-5:])
+            current_ma20 = fmean(bar.close for bar in bars[-20:])
+            current_volume_ma20 = fmean(bar.volume for bar in bars[-20:])
+            if (
+                previous_ma5 < previous_ma20
+                and current_ma5 > current_ma20
+                and bars[-1].volume > current_volume_ma20 * 1.5
+            ):
+                selected.append(instrument_id)
+        return self._result(snapshot, selected)

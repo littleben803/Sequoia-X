@@ -1,9 +1,7 @@
 """涨停洗盘策略：昨日涨停后今日放量收阴但不破昨收。"""
 
-from sequoia_x.core.logger import get_logger
-from sequoia_x.strategy.base import BaseStrategy
-
-logger = get_logger(__name__)
+from sequoia_x.data.research import ResearchSnapshot
+from sequoia_x.strategy.base import BaseStrategy, StrategyResult
 
 
 class LimitUpShakeoutStrategy(BaseStrategy):
@@ -20,44 +18,25 @@ class LimitUpShakeoutStrategy(BaseStrategy):
     """
 
     webhook_key: str = "shakeout"
+    strategy_key: str = "shakeout"
     _MIN_BARS: int = 3  # 至少需要 3 根 K 线（前日、昨日、今日）
+    rule_basis = (
+        "前一交易日收盘价不低于前二交易日收盘价的1.095倍",
+        "当日收阴、成交量大于前一日2倍且最低价不低于前一日收盘价",
+    )
+    risk_note = "未完成独立回测；固定9.5%阈值未区分板块、ST和特殊交易规则，默认禁用。"
 
-    def run(self) -> list[str]:
-        """
-        遍历全市场，返回满足涨停洗盘条件的股票代码列表。
-
-        Returns:
-            满足条件的股票代码列表。
-        """
-        symbols = self.engine.get_local_symbols()
+    def run(self, snapshot: ResearchSnapshot) -> StrategyResult:
         selected: list[str] = []
-
-        for symbol in symbols:
-            try:
-                df = self.engine.get_ohlcv(symbol)
-                if len(df) < self._MIN_BARS:
-                    continue
-
-                # 取最近三根 K 线（向量化索引，无 iterrows）
-                prev2 = df.iloc[-3]  # 前日
-                prev1 = df.iloc[-2]  # 昨日
-                today = df.iloc[-1]  # 今日
-
-                # 条件 1：昨日涨停
-                limit_up_yesterday = prev1["close"] >= prev2["close"] * 1.095
-                # 条件 2：今日收阴
-                bearish_today = today["close"] < today["open"]
-                # 条件 3：今日放量
-                volume_surge = today["volume"] > prev1["volume"] * 2.0
-                # 条件 4：支撑不破
-                support_hold = today["low"] >= prev1["close"]
-
-                if limit_up_yesterday and bearish_today and volume_surge and support_hold:
-                    selected.append(symbol)
-
-            except Exception as exc:
-                logger.warning(f"[{symbol}] LimitUpShakeoutStrategy 计算失败：{exc}")
+        for instrument_id, bars in snapshot.bars.items():
+            if len(bars) < self._MIN_BARS:
                 continue
-
-        logger.info(f"LimitUpShakeoutStrategy 选出 {len(selected)} 只股票")
-        return selected
+            previous_two, previous, current = bars[-3:]
+            if (
+                previous.close >= previous_two.close * 1.095
+                and current.close < current.open
+                and current.volume > previous.volume * 2.0
+                and current.low >= previous.close
+            ):
+                selected.append(instrument_id)
+        return self._result(snapshot, selected)

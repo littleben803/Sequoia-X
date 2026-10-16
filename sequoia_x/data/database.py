@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from collections import Counter
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from sequoia_x.data.classification import classify_security
 from sequoia_x.data.models import (
+    Adjustment,
+    AdjustmentFactorRecord,
     BatchStatus,
     DailySnapshotResult,
     DailyStatus,
@@ -24,7 +27,7 @@ from sequoia_x.data.models import (
     V3AuditReport,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 WriteProgressCallback = Callable[[str, int, int, str], None]
 
 
@@ -149,6 +152,21 @@ class MarketDataRepository:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(instrument_id, trade_date)
                 );
+
+                CREATE TABLE IF NOT EXISTS adjustment_factors (
+                    instrument_id TEXT NOT NULL REFERENCES instruments(instrument_id),
+                    effective_date TEXT NOT NULL,
+                    factor REAL NOT NULL,
+                    kind TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    source_batch_id TEXT NOT NULL REFERENCES ingestion_batches(batch_id),
+                    raw_payload_json TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY(instrument_id, effective_date, kind, provider)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_adjustment_factor_lookup
+                ON adjustment_factors(instrument_id, kind, effective_date);
 
                 CREATE TABLE IF NOT EXISTS trade_calendar (
                     market TEXT NOT NULL,
@@ -293,6 +311,17 @@ class MarketDataRepository:
                 ).fetchone()
                 is not None
             )
+
+    def latest_complete_snapshot_date(self) -> str | None:
+        """返回最新完整全市场盘后批次日期，不执行全库质量审计。"""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MAX(trade_date) FROM ingestion_batches
+                WHERE capability='DAILY_SNAPSHOT' AND status='COMPLETE'
+                """
+            ).fetchone()
+        return row[0] if row else None
 
     def save_calendar(self, days: tuple[TradeCalendarDay, ...]) -> None:
         now = self._now()
@@ -558,6 +587,101 @@ class MarketDataRepository:
             self.save_daily_status(no_trade_records)
         return inserted, updated
 
+    def save_adjustment_factors(
+        self,
+        batch_id: str,
+        records: tuple[AdjustmentFactorRecord, ...],
+    ) -> tuple[int, int]:
+        """幂等保存单个证券的复权因子，并在同一事务中完成批次。"""
+        if not records:
+            raise ValueError("复权因子为空，不能冒充成功批次")
+        instrument_ids = {record.instrument_id for record in records}
+        kinds = {record.kind for record in records}
+        providers = {record.provider for record in records}
+        if len(instrument_ids) != 1 or len(kinds) != 1 or len(providers) != 1:
+            raise ValueError("单个复权因子批次只能包含一个证券、口径和 Provider")
+        now = self._now()
+        inserted = updated = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            batch = conn.execute(
+                "SELECT status FROM ingestion_batches WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+            if batch is None or batch[0] != BatchStatus.RUNNING:
+                raise ValueError("复权因子批次不存在或已结束")
+            for record in records:
+                if record.kind not in (Adjustment.QFQ, Adjustment.HFQ):
+                    raise ValueError("复权因子口径只能是 QFQ 或 HFQ")
+                try:
+                    date.fromisoformat(record.effective_date)
+                except ValueError as error:
+                    raise ValueError("复权因子生效日必须是 ISO 日期") from error
+                if not math.isfinite(record.factor) or record.factor <= 0:
+                    raise ValueError("复权因子必须是大于 0 的有限数")
+                existing = conn.execute(
+                    """
+                    SELECT 1 FROM adjustment_factors
+                    WHERE instrument_id=? AND effective_date=? AND kind=? AND provider=?
+                    """,
+                    (
+                        record.instrument_id,
+                        record.effective_date,
+                        record.kind,
+                        record.provider,
+                    ),
+                ).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO adjustment_factors
+                        (instrument_id, effective_date, factor, kind, provider,
+                         source_batch_id, raw_payload_json, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(instrument_id, effective_date, kind, provider) DO UPDATE SET
+                        factor=excluded.factor,
+                        source_batch_id=excluded.source_batch_id,
+                        raw_payload_json=excluded.raw_payload_json,
+                        fetched_at=excluded.fetched_at
+                    """,
+                    (
+                        record.instrument_id,
+                        record.effective_date,
+                        record.factor,
+                        record.kind,
+                        record.provider,
+                        batch_id,
+                        json.dumps(record.raw_payload, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                inserted += existing is None
+                updated += existing is not None
+            conn.execute(
+                """
+                UPDATE ingestion_batches SET finished_at=?, status=?, requested_count=?,
+                    received_count=?, valid_count=?, inserted_count=?, updated_count=?,
+                    metadata_json=?
+                WHERE batch_id=?
+                """,
+                (
+                    now,
+                    BatchStatus.COMPLETE,
+                    len(records),
+                    len(records),
+                    len(records),
+                    inserted,
+                    updated,
+                    json.dumps(
+                        {
+                            "instrument_id": next(iter(instrument_ids)),
+                            "kind": next(iter(kinds)),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    batch_id,
+                ),
+            )
+        return inserted, updated
+
     def save_daily_status(self, records: tuple[TradingStatusRecord, ...]) -> None:
         now = self._now()
         with self.connect() as conn:
@@ -656,7 +780,15 @@ class MarketDataRepository:
                 for row in conn.execute(
                     """
                     SELECT instrument_id, MIN(trade_date), MAX(trade_date)
-                    FROM daily_bars_canonical GROUP BY instrument_id
+                    FROM (
+                        SELECT instrument_id, trade_date
+                        FROM daily_bars_canonical
+                        UNION ALL
+                        SELECT instrument_id, trade_date
+                        FROM daily_bars_raw
+                        WHERE adjustment='RAW'
+                    )
+                    GROUP BY instrument_id
                     """
                 )
             }

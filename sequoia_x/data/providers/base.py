@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
 from sequoia_x.data.models import (
     DailyBar,
@@ -43,3 +43,7 @@ class MarketDataProvider(Protocol):
     def fetch_trading_status(
         self, instruments: Sequence[InstrumentRecord], trade_date: str
     ) -> tuple[TradingStatusRecord, ...]: ...
+
+    def fetch_adjustment_factors(
+        self, code: str, kind: str = "qfq"
+    ) -> tuple[dict[str, Any], ...]: ...
