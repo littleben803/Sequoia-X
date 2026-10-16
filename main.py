@@ -9,6 +9,10 @@ import sqlite3
 import time
 from datetime import date, timedelta
 
+from sequoia_x.backtest.data import BacktestDataService
+from sequoia_x.backtest.engine import BacktestEngine
+from sequoia_x.backtest.models import BacktestConfig
+from sequoia_x.backtest.reporting import write_backtest_report
 from sequoia_x.core.config import Settings, get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.database import MarketDataRepository
@@ -72,6 +76,47 @@ def _parse_args() -> argparse.Namespace:
         help="显式选择策略，可重复；默认读取 ENABLED_STRATEGIES",
     )
     scan.add_argument("--output", default="reports/latest.json", help="本地 JSON 报告路径")
+
+    backtest_parser = commands.add_parser("backtest", help="V3 本地历史信号回测")
+    backtest_commands = backtest_parser.add_subparsers(dest="backtest_command")
+    backtest_audit = backtest_commands.add_parser("audit", help="只读审计回测数据区间")
+    backtest_audit.add_argument("--start", required=True, help="起始日期 YYYY-MM-DD")
+    backtest_audit.add_argument("--end", required=True, help="结束日期 YYYY-MM-DD")
+    backtest_audit.add_argument("--history-bars", type=int, default=121, help="历史窗口")
+    backtest_run = backtest_commands.add_parser("run", help="运行逐日信号与前瞻收益评价")
+    backtest_run.add_argument("--start", required=True, help="起始日期 YYYY-MM-DD")
+    backtest_run.add_argument("--end", required=True, help="结束日期 YYYY-MM-DD")
+    backtest_run.add_argument(
+        "--strategy",
+        action="append",
+        choices=sorted(STRATEGY_TYPES),
+        help="显式选择策略，可重复；默认读取 ENABLED_STRATEGIES",
+    )
+    backtest_run.add_argument(
+        "--horizon",
+        action="append",
+        type=int,
+        help="前瞻交易日数，可重复；默认 1/5/10/20",
+    )
+    backtest_run.add_argument("--history-bars", type=int, default=121, help="历史窗口")
+    backtest_run.add_argument("--initial-cash", type=float, default=1_000_000, help="初始资金")
+    backtest_run.add_argument("--holding-period", type=int, default=5, help="固定持有交易日")
+    backtest_run.add_argument(
+        "--exit-retry-days", type=int, default=5, help="卖出受阻后的尾部重试交易日"
+    )
+    backtest_run.add_argument("--max-positions", type=int, default=10, help="最大同时持仓数")
+    backtest_run.add_argument(
+        "--commission-rate", type=float, default=0.0003, help="双边佣金率"
+    )
+    backtest_run.add_argument(
+        "--minimum-commission", type=float, default=5.0, help="单笔最低佣金"
+    )
+    backtest_run.add_argument("--slippage-bps", type=float, default=0.0, help="单边滑点基点")
+    backtest_run.add_argument(
+        "--output",
+        default="reports/backtest-latest.json",
+        help="本地 JSON 报告路径",
+    )
     return parser.parse_args()
 
 
@@ -273,6 +318,107 @@ def _run_research_scan(
     return 0
 
 
+def _run_backtest_audit(
+    settings: Settings,
+    repository: MarketDataRepository,
+    *,
+    start_date: str,
+    end_date: str,
+    history_bars: int,
+) -> int:
+    date.fromisoformat(start_date)
+    date.fromisoformat(end_date)
+    if end_date < start_date:
+        raise ValueError("结束日期不能早于开始日期")
+    if history_bars < 121:
+        raise ValueError("历史窗口不能少于 121 个交易日")
+    report = BacktestDataService(
+        repository,
+        minimum_coverage=settings.minimum_latest_coverage,
+    ).audit_range(
+        start_date=start_date,
+        end_date=end_date,
+        history_bars=history_bars,
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["ready"] else 1
+
+
+def _run_backtest(
+    settings: Settings,
+    repository: MarketDataRepository,
+    *,
+    start_date: str,
+    end_date: str,
+    requested_strategies: list[str] | None,
+    horizons: list[int] | None,
+    history_bars: int,
+    initial_cash: float,
+    holding_period: int,
+    exit_retry_days: int,
+    max_positions: int,
+    commission_rate: float,
+    minimum_commission: float,
+    slippage_bps: float,
+    output_path: str,
+) -> int:
+    keys = _strategy_keys(settings, requested_strategies)
+    config = BacktestConfig(
+        start_date=start_date,
+        end_date=end_date,
+        strategy_keys=keys,
+        horizons=tuple(horizons or (1, 5, 10, 20)),
+        history_bars=history_bars,
+        minimum_coverage=settings.minimum_latest_coverage,
+        initial_cash=initial_cash,
+        holding_period=holding_period,
+        exit_retry_days=exit_retry_days,
+        max_positions=max_positions,
+        commission_rate=commission_rate,
+        minimum_commission=minimum_commission,
+        slippage_bps=slippage_bps,
+    )
+    data = BacktestDataService(
+        repository,
+        minimum_coverage=config.minimum_coverage,
+    )
+    result = BacktestEngine(data).run(config)
+    report_path = write_backtest_report(
+        result=result,
+        database_path=repository.db_path,
+        output_path=output_path,
+    )
+    print(
+        json.dumps(
+            {
+                "status": "COMPLETE",
+                "start_date": config.start_date,
+                "end_date": config.end_date,
+                "signal_dates": len(result.signal_dates),
+                "signals": len(result.signals),
+                "outcomes": len(result.outcomes),
+                "calculation_errors": len(result.calculation_errors),
+                "portfolios": {
+                    item.strategy_key: {
+                        "final_equity": item.final_equity,
+                        "total_return": item.total_return,
+                        "max_drawdown": item.max_drawdown,
+                        "filled_buys": item.filled_buys,
+                        "filled_sells": item.filled_sells,
+                        "open_positions": len(item.open_positions),
+                    }
+                    for item in result.portfolios
+                },
+                "report_path": str(report_path),
+                "risk_boundary": "历史日线模拟，不代表实盘可成交结果或未来收益。",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def main() -> None:
     args = _parse_args()
     try:
@@ -320,6 +466,39 @@ def main() -> None:
                     )
                 )
             logger.info("`python main.py research --help` 查看研究命令")
+            return
+        if args.command == "backtest":
+            if args.backtest_command == "audit":
+                raise SystemExit(
+                    _run_backtest_audit(
+                        settings,
+                        repository,
+                        start_date=args.start,
+                        end_date=args.end,
+                        history_bars=args.history_bars,
+                    )
+                )
+            if args.backtest_command == "run":
+                raise SystemExit(
+                    _run_backtest(
+                        settings,
+                        repository,
+                        start_date=args.start,
+                        end_date=args.end,
+                        requested_strategies=args.strategy,
+                        horizons=args.horizon,
+                        history_bars=args.history_bars,
+                        initial_cash=args.initial_cash,
+                        holding_period=args.holding_period,
+                        exit_retry_days=args.exit_retry_days,
+                        max_positions=args.max_positions,
+                        commission_rate=args.commission_rate,
+                        minimum_commission=args.minimum_commission,
+                        slippage_bps=args.slippage_bps,
+                        output_path=args.output,
+                    )
+                )
+            logger.info("`python main.py backtest --help` 查看回测命令")
             return
         if args.command != "data":
             logger.info("`python main.py --help` 查看数据与研究命令")

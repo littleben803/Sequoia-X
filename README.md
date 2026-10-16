@@ -21,6 +21,9 @@ Sequoia-X V3 当前优先建设可信数据底座：按交易日下载通达信�
 默认四个策略已切换到 V3 研究快照。扫描只读本地数据，质量闸门或复权因子
 覆盖不足时会停止，不会静默输出部分候选股。
 
+V3 回测已提供逐历史日信号评价，以及独立策略组合的 T+1 开盘成交、固定持有期、费用、
+仓位、订单审计和权益曲线。所有结果都是本地日线模拟，不代表实盘可成交或未来收益。
+
 ## 安装
 
 需要 Python 3.10 或更高版本，推荐使用 `uv`：
@@ -94,6 +97,28 @@ uv run python main.py --scan-only
 `research scan` 会依次展示扫描配置、可信研究快照构建、逐策略计算和报告写入四个
 阶段；完成后输出数据日期、覆盖率、各策略入选数量、去重候选数量和报告路径 Summary。
 
+## 回测命令
+
+```bash
+# 先只读审计区间
+uv run python main.py backtest audit --start 2025-01-01 --end 2025-12-31
+
+# 默认策略信号回测，输出 reports/backtest-latest.json
+uv run python main.py backtest run --start 2025-01-01 --end 2025-12-31
+
+# 显式选择策略和前瞻周期
+uv run python main.py backtest run \
+  --start 2025-01-01 --end 2025-12-31 \
+  --strategy rps --horizon 5 --horizon 20 \
+  --holding-period 5 --max-positions 10
+```
+
+回测只读取本地 V3 数据。T 日策略仅看到 T 日及以前的研究快照；前瞻收益使用 T 日 QFQ
+收盘价到第 N 个完整交易日 QFQ 收盘价计算。组合按 T+1 开盘、100 股整数手、固定持有期、
+佣金与卖出印花税模拟，并明确记录拒单和延期卖出；日线结果仍不代表实盘收益。详细边界见
+[V3 回测架构](docs/architecture/backtest-v3.md) 和
+[回测运行手册](docs/backtest/operations.md)。
+
 ## 数据源与降级
 
 主路径每个交易日只下载一个通达信盘后包。包内三市场数据必须通过文件存在、块长度、
@@ -148,6 +173,8 @@ uv run python -m compileall -q main.py sequoia_x
 uv run python main.py --help
 uv run python main.py data --help
 uv run python main.py research --help
+uv run python main.py backtest --help
+uv run python main.py backtest run --help
 git diff --check
 git status --short
 ```

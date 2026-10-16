@@ -213,6 +213,63 @@ def test_research_quality_gate_failure_exits_one() -> None:
     assert exc_info.value.code == 1
 
 
+def test_backtest_run_dispatches_explicit_configuration() -> None:
+    settings = SimpleNamespace(
+        db_path="data/test-v3.db",
+        start_date="2024-01-01",
+        enabled_strategies="ma_volume,turtle,flag,rps",
+        minimum_latest_coverage=0.95,
+    )
+    repository = Mock()
+    service = Mock()
+
+    with (
+        patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "backtest",
+                "run",
+                "--start",
+                "2026-01-01",
+                "--end",
+                "2026-06-30",
+                "--strategy",
+                "rps",
+                "--horizon",
+                "5",
+                "--output",
+                "reports/rps.json",
+            ],
+        ),
+        patch.object(main_module, "get_settings", return_value=settings),
+        patch.object(main_module, "_components", return_value=(repository, service)),
+        patch.object(main_module, "_run_backtest", return_value=0) as run_backtest,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main_module.main()
+
+    assert exc_info.value.code == 0
+    run_backtest.assert_called_once_with(
+        settings,
+        repository,
+        start_date="2026-01-01",
+        end_date="2026-06-30",
+        requested_strategies=["rps"],
+        horizons=[5],
+        history_bars=121,
+        initial_cash=1_000_000,
+        holding_period=5,
+        exit_retry_days=5,
+        max_positions=10,
+        commission_rate=0.0003,
+        minimum_commission=5.0,
+        slippage_bps=0.0,
+        output_path="reports/rps.json",
+    )
+
+
 def test_default_strategy_selection_keeps_experimental_strategies_disabled() -> None:
     settings = SimpleNamespace(enabled_strategies="ma_volume,turtle,flag,rps")
 

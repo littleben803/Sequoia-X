@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from sequoia_x.backtest.data import BacktestDataService
 from sequoia_x.data.classification import sse_security_subtype
 from sequoia_x.data.database import MarketDataRepository
 from sequoia_x.data.models import (
@@ -147,6 +148,22 @@ def test_research_snapshot_uses_one_date_and_qfq_prices(tmp_path: Path) -> None:
     assert bar.volume == 1_000
     assert bar.amount == 20_000
     assert bar.price_adjustment == "QFQ"
+
+
+def test_bulk_backtest_snapshot_matches_standard_research_snapshot(tmp_path: Path) -> None:
+    stock = _stock("600001")
+    repository = _prepare_repository(tmp_path, (stock,))
+    _save_qfq(repository, stock, 2.0)
+    standard = ResearchDataService(repository).build_snapshot(history_bars=121)
+    service = BacktestDataService(repository)
+
+    service.prepare_snapshots(("2026-10-13",), history_bars=121)
+    bulk = service.build_snapshot("2026-10-13", history_bars=121)
+
+    assert bulk.as_of_date == standard.as_of_date
+    assert bulk.bars == standard.bars
+    assert bulk.exclusions == standard.exclusions
+    assert bulk.coverage == standard.coverage
 
 
 def test_missing_factor_is_excluded_and_never_treated_as_raw_price(tmp_path: Path) -> None:

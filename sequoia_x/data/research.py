@@ -155,6 +155,31 @@ class ResearchRepository:
             ).fetchall()
         return tuple(row[0] for row in rows)
 
+    def load_a_share_lifecycles(self) -> tuple[tuple[str, str, str | None], ...]:
+        """一次读取回测所需 A 股身份及有效期，不绑定当前日期。"""
+        with self.market_data.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT instrument_id,
+                       COALESCE(code_valid_from, list_date, first_seen_date),
+                       COALESCE(code_valid_to, delist_date)
+                FROM instruments
+                WHERE security_type='STOCK'
+                  AND exchange<>'BSE'
+                  AND COALESCE(
+                        security_subtype,
+                        CASE
+                            WHEN exchange='SSE'
+                             AND CAST(json_extract(metadata_json, '$.STOCK_TYPE') AS TEXT)='8'
+                            THEN 'CDR'
+                        END,
+                        ''
+                      )<>'CDR'
+                ORDER BY instrument_id
+                """
+            ).fetchall()
+        return tuple((row[0], row[1], row[2]) for row in rows)
+
     def listed_a_shares(
         self, as_of_date: str
     ) -> tuple[tuple[str, str, str, str, str | None], ...]:
@@ -221,6 +246,15 @@ class ResearchRepository:
                     grouped.setdefault(row[0], []).append(tuple(row[1:]))
         return {key: tuple(value) for key, value in grouped.items()}
 
+    def load_backtest_raw_bars(
+        self,
+        end_date: str,
+        bars_per_instrument: int,
+        instrument_ids: tuple[str, ...],
+    ) -> dict[str, tuple[tuple, ...]]:
+        """批量读取截止结束日每只证券最近 N 根研究行情。"""
+        return self.load_recent_raw_bars(end_date, bars_per_instrument, instrument_ids)
+
     def load_qfq_factors(self, as_of_date: str) -> dict[str, tuple[tuple[str, float], ...]]:
         with self.market_data.connect() as conn:
             rows = conn.execute(
@@ -247,6 +281,31 @@ class ResearchRepository:
         grouped: dict[str, list[tuple[str, float]]] = {}
         for instrument_id, effective_date, factor in rows:
             grouped.setdefault(instrument_id, []).append((effective_date, factor))
+        return {key: tuple(value) for key, value in grouped.items()}
+
+    def load_qfq_factor_evidence(
+        self, end_date: str
+    ) -> dict[str, tuple[tuple[str, float, str, str, str], ...]]:
+        """批量读取因子及证据日期，供历史日按原规则选择 Provider。"""
+        with self.market_data.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT f.instrument_id, f.effective_date, f.factor, b.trade_date,
+                       f.fetched_at, f.provider
+                FROM adjustment_factors AS f
+                JOIN ingestion_batches AS b ON b.batch_id=f.source_batch_id
+                WHERE f.kind='QFQ' AND f.effective_date<=? AND b.status='COMPLETE'
+                ORDER BY f.instrument_id, f.effective_date, f.fetched_at DESC, f.provider
+                """,
+                (end_date,),
+            ).fetchall()
+        grouped: dict[str, list[tuple[str, float, str, str, str]]] = {}
+        for instrument_id, effective_date, factor, evidence_date, fetched_at, provider in rows:
+            if evidence_date is None:
+                continue
+            grouped.setdefault(instrument_id, []).append(
+                (effective_date, factor, evidence_date, fetched_at, provider)
+            )
         return {key: tuple(value) for key, value in grouped.items()}
 
 
@@ -450,6 +509,7 @@ class ResearchDataService:
         as_of_date: str | None = None,
         minimum_coverage: float = 0.95,
         progress_callback: ResearchSnapshotProgressCallback | None = None,
+        base_audit: V3AuditReport | None = None,
     ) -> ResearchSnapshot:
         if not 0 < minimum_coverage <= 1:
             raise ValueError("minimum_coverage 必须在 (0, 1] 范围内")
@@ -459,7 +519,7 @@ class ResearchDataService:
             message="正在审计基础数据完整性",
             as_of_date=as_of_date,
         )
-        audit = self.market_data.audit()
+        audit = base_audit or self.market_data.audit()
         target_date = self._require_target_date(audit, as_of_date)
         self._emit_snapshot_progress(
             progress_callback,
@@ -496,10 +556,11 @@ class ResearchDataService:
         history_bars: int,
         as_of_date: str | None = None,
         minimum_coverage: float = 0.95,
+        base_audit: V3AuditReport | None = None,
     ) -> ResearchSnapshotAudit:
         if not 0 < minimum_coverage <= 1:
             raise ValueError("minimum_coverage 必须在 (0, 1] 范围内")
-        audit = self.market_data.audit()
+        audit = base_audit or self.market_data.audit()
         try:
             target_date = self._require_target_date(audit, as_of_date)
         except ResearchDataError as error:
@@ -612,7 +673,7 @@ class ResearchDataService:
                 exclusions.append(ResearchExclusion(instrument_id, "NO_BAR_ON_RESEARCH_DATE"))
                 continue
             try:
-                adjusted[instrument_id] = self._apply_qfq(instrument_id, bars, factor_rows)
+                adjusted[instrument_id] = self.apply_qfq(instrument_id, bars, factor_rows)
             except ResearchDataError as error:
                 exclusions.append(ResearchExclusion(instrument_id, str(error)))
 
@@ -655,7 +716,7 @@ class ResearchDataService:
             )
 
     @staticmethod
-    def _apply_qfq(
+    def apply_qfq(
         instrument_id: str,
         bars: tuple[tuple, ...],
         factors: tuple[tuple[str, float], ...],
