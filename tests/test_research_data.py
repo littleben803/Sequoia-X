@@ -165,6 +165,24 @@ def test_bulk_backtest_snapshot_matches_standard_research_snapshot(tmp_path: Pat
     assert bulk.exclusions == standard.exclusions
     assert bulk.coverage == standard.coverage
 
+    service.benchmark_closes = lambda _instrument_id, dates: tuple((day, 100.0) for day in dates)
+    events = []
+    report = service.audit_range(
+        start_date="2026-10-13",
+        end_date="2026-10-13",
+        history_bars=121,
+        progress_callback=events.append,
+    )
+    assert report["ready"] is True
+    assert all(item["missing_days"] == 0 for item in report["benchmark_audits"])
+    assert report["elapsed_seconds"] >= 0
+    assert [event.phase for event in events] == [
+        "LOADING_DATES",
+        "AUDITING_BASE",
+        "AUDITING_BOUNDARY",
+        "COMPLETE",
+    ]
+
 
 def test_missing_factor_is_excluded_and_never_treated_as_raw_price(tmp_path: Path) -> None:
     covered = _stock("600001")
@@ -172,9 +190,7 @@ def test_missing_factor_is_excluded_and_never_treated_as_raw_price(tmp_path: Pat
     repository = _prepare_repository(tmp_path, (covered, missing))
     _save_qfq(repository, covered, 2.0)
 
-    snapshot = ResearchDataService(repository).build_snapshot(
-        history_bars=20, minimum_coverage=0.5
-    )
+    snapshot = ResearchDataService(repository).build_snapshot(history_bars=20, minimum_coverage=0.5)
 
     assert tuple(snapshot.bars) == (covered.instrument_id,)
     assert len(snapshot.exclusions) == 1
@@ -189,9 +205,7 @@ def test_snapshot_fails_when_coverage_is_below_gate(tmp_path: Path) -> None:
     _save_qfq(repository, covered, 2.0)
 
     with pytest.raises(ResearchDataError, match="覆盖率"):
-        ResearchDataService(repository).build_snapshot(
-            history_bars=20, minimum_coverage=0.95
-        )
+        ResearchDataService(repository).build_snapshot(history_bars=20, minimum_coverage=0.95)
 
 
 def test_factor_evidence_older_than_research_date_is_not_accepted(tmp_path: Path) -> None:
@@ -233,9 +247,7 @@ def test_no_bar_on_research_date_is_excluded_even_when_gap_is_explained(tmp_path
     _save_qfq(repository, traded, 2.0)
     _save_qfq(repository, suspended, 2.0)
 
-    snapshot = ResearchDataService(repository).build_snapshot(
-        history_bars=20, minimum_coverage=0.5
-    )
+    snapshot = ResearchDataService(repository).build_snapshot(history_bars=20, minimum_coverage=0.5)
 
     assert suspended.instrument_id not in snapshot.bars
     assert snapshot.exclusions[-1].reason == "NO_BAR_ON_RESEARCH_DATE"
@@ -254,9 +266,7 @@ def test_research_audit_reports_exclusions_without_throwing(tmp_path: Path) -> N
     repository = _prepare_repository(tmp_path, (covered, missing))
     _save_qfq(repository, covered, 2.0)
 
-    report = ResearchDataService(repository).audit_snapshot(
-        history_bars=20, minimum_coverage=0.95
-    )
+    report = ResearchDataService(repository).audit_snapshot(history_bars=20, minimum_coverage=0.95)
 
     assert report.ready is False
     assert report.as_of_date == "2026-10-13"
@@ -319,9 +329,7 @@ def test_factor_refresh_skips_cdr_and_excludes_it_from_research_universe(
     )
     repository = _prepare_repository(tmp_path, (ordinary, cdr, bse))
     provider = Mock(provider_name="sina")
-    provider.fetch_adjustment_factors.return_value = (
-        {"date": "1900-01-01", "factor": 1.0},
-    )
+    provider.fetch_adjustment_factors.return_value = ({"date": "1900-01-01", "factor": 1.0},)
 
     report = AdjustmentFactorService(repository, provider).refresh_qfq("2026-10-13")
 

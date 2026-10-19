@@ -119,6 +119,37 @@ class DailySnapshotResult:
 
 
 @dataclass(frozen=True)
+class BenchmarkBarsResult:
+    instrument: InstrumentRecord
+    start_date: str
+    end_date: str
+    provider: str
+    source_url: str
+    bars: tuple[DailyBar, ...]
+    checksum: str
+
+
+@dataclass(frozen=True)
+class BenchmarkSyncReport:
+    instrument_id: str
+    name: str
+    start_date: str
+    end_date: str
+    fetched_rows: int
+    inserted_rows: int
+    updated_rows: int
+    elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class BenchmarkProgress:
+    phase: str
+    message: str
+    step: int
+    total_steps: int = 3
+
+
+@dataclass(frozen=True)
 class TradeCalendarDay:
     calendar_date: str
     is_trading_day: bool

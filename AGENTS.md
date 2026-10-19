@@ -60,6 +60,10 @@
 - 推荐 IDE：PyCharm 或 VS Code；也可以只使用 macOS Terminal。
 - 当前产品是命令行程序，没有图形交互界面。默认结果写入 `reports/latest.json`，飞书通知为可选能力。
 - 首次运行、日常运行、数据审计命令必须同步维护在 `README.md`。
+- 面向用户的数据更新只维护一个日常入口：`python main.py data sync`。新增数据底座能力必须
+  接入该命令的统一编排、增量检查、进度和失败状态，不得要求用户记忆或串行执行额外的
+  数据同步子命令。回测前的数据就绪检查统一使用 `python main.py backtest audit`；
+  `backtest run` 继续保持纯本地只读且不得隐式联网。
 
 ## 验证与阶段汇报
 

@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 from sequoia_x.data.models import (
+    BenchmarkBarsResult,
     DailyBar,
     DailySnapshotResult,
     InstrumentRecord,
@@ -22,6 +23,7 @@ class ProviderCapability(StrEnum):
     TRADE_CALENDAR = "TRADE_CALENDAR"
     TRADING_STATUS = "TRADING_STATUS"
     ADJUSTMENT_FACTOR = "ADJUSTMENT_FACTOR"
+    BENCHMARK_BARS = "BENCHMARK_BARS"
 
 
 class MarketDataProvider(Protocol):
@@ -47,3 +49,7 @@ class MarketDataProvider(Protocol):
     def fetch_adjustment_factors(
         self, code: str, kind: str = "qfq"
     ) -> tuple[dict[str, Any], ...]: ...
+
+    def fetch_benchmark_bars(
+        self, instrument_id: str, start_date: str, end_date: str
+    ) -> BenchmarkBarsResult: ...

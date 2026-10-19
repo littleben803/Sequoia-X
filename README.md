@@ -22,7 +22,9 @@ Sequoia-X V3 当前优先建设可信数据底座：按交易日下载通达信�
 覆盖不足时会停止，不会静默输出部分候选股。
 
 V3 回测已提供逐历史日信号评价，以及独立策略组合的 T+1 开盘成交、固定持有期、费用、
-仓位、订单审计和权益曲线。所有结果都是本地日线模拟，不代表实盘可成交或未来收益。
+仓位、订单审计和权益曲线。组合报告包含年度收益、Sharpe、Sortino、已平仓交易胜率、
+盈亏比、双边换手率，以及同期沪深300和超额收益。所有结果都是本地日线模拟，不代表
+实盘可成交或未来收益。
 
 ## 安装
 
@@ -103,6 +105,9 @@ uv run python main.py --scan-only
 # 先只读审计区间
 uv run python main.py backtest audit --start 2025-01-01 --end 2025-12-31
 
+# 自动化脚本需要原始 JSON 时
+uv run python main.py backtest audit --start 2025-01-01 --end 2025-12-31 --json
+
 # 默认策略信号回测，输出 reports/backtest-latest.json
 uv run python main.py backtest run --start 2025-01-01 --end 2025-12-31
 
@@ -111,6 +116,10 @@ uv run python main.py backtest run \
   --start 2025-01-01 --end 2025-12-31 \
   --strategy rps --horizon 5 --horizon 20 \
   --holding-period 5 --max-positions 10
+
+# 脚本调用：关闭动态进度和人类 Summary，只输出机器可读结果
+uv run python main.py backtest run \
+  --start 2025-01-01 --end 2025-12-31 --strategy rps --json
 ```
 
 回测只读取本地 V3 数据。T 日策略仅看到 T 日及以前的研究快照；前瞻收益使用 T 日 QFQ
@@ -118,6 +127,11 @@ uv run python main.py backtest run \
 佣金与卖出印花税模拟，并明确记录拒单和延期卖出；日线结果仍不代表实盘收益。详细边界见
 [V3 回测架构](docs/architecture/backtest-v3.md) 和
 [回测运行手册](docs/backtest/operations.md)。
+
+当前双基准固定读取本地 canonical 行情 `SSE:000300`（沪深300）和 `SSE:000985`
+（中证全指）。`data sync` 会在全市场行情成功后自动检查并增量补齐中证全指；无缺口时
+不发起额外请求。`backtest run` 本身仍不访问网络。任一基准的必要交易日缺失时回测会
+停止，不会用旧价格或其他指数静默替代。
 
 ## 数据源与降级
 

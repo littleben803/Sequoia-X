@@ -12,6 +12,8 @@ from typing import TypeVar, cast
 from sequoia_x.data.database import MarketDataRepository
 from sequoia_x.data.errors import DataNotAvailableError
 from sequoia_x.data.models import (
+    BenchmarkProgress,
+    BenchmarkSyncReport,
     DailyStatus,
     IngestionProgress,
     IngestionReport,
@@ -20,6 +22,7 @@ from sequoia_x.data.models import (
 from sequoia_x.data.router import ProviderRouter
 
 ProgressCallback = Callable[[IngestionProgress], None]
+BenchmarkProgressCallback = Callable[[BenchmarkProgress], None]
 T = TypeVar("T")
 
 
@@ -41,6 +44,77 @@ class DataApplicationService:
         count = self.repository.upsert_instruments(instruments, end_date)
         self.repository.set_metadata("instrument_directory_status", "COMPLETE")
         return len(calendar), count, degraded, warning
+
+    def sync_benchmark(
+        self,
+        instrument_id: str,
+        start_date: str,
+        end_date: str,
+        progress_callback: BenchmarkProgressCallback | None = None,
+        required_dates: tuple[str, ...] = (),
+    ) -> BenchmarkSyncReport:
+        """显式联网补齐单个基准；回测本身仍保持纯本地只读。"""
+        started = time.monotonic()
+        if progress_callback:
+            progress_callback(BenchmarkProgress("FETCHING", "正在下载并校验基准日线", 1))
+        batch_id = self.repository.start_batch("tencent", "BENCHMARK_BARS", end_date)
+        try:
+            result = self.router.primary.fetch_benchmark_bars(instrument_id, start_date, end_date)
+            returned_dates = {bar.trade_date for bar in result.bars}
+            still_missing = tuple(day for day in required_dates if day not in returned_dates)
+            if still_missing:
+                raise DataNotAvailableError(
+                    f"基准 {instrument_id} 来源缺少 {len(still_missing)} 个完整交易日，"
+                    f"首个缺口 {still_missing[0]}"
+                )
+            if progress_callback:
+                progress_callback(
+                    BenchmarkProgress("WRITING", f"正在原子保存 {len(result.bars):,} 条基准行情", 2)
+                )
+            inserted, updated = self.repository.save_benchmark_bars(batch_id, result)
+        except KeyboardInterrupt:
+            self.repository.interrupt_batch(batch_id)
+            raise
+        except Exception as error:
+            self.repository.fail_batch(batch_id, error)
+            raise
+        if progress_callback:
+            progress_callback(BenchmarkProgress("COMPLETE", "基准行情同步完成", 3))
+        return BenchmarkSyncReport(
+            instrument_id=result.instrument.instrument_id,
+            name=result.instrument.name,
+            start_date=result.start_date,
+            end_date=result.end_date,
+            fetched_rows=len(result.bars),
+            inserted_rows=inserted,
+            updated_rows=updated,
+            elapsed_seconds=time.monotonic() - started,
+        )
+
+    def sync_supplemental_data(
+        self,
+        start_date: str,
+        end_date: str,
+        progress_callback: BenchmarkProgressCallback | None = None,
+    ) -> tuple[BenchmarkSyncReport, ...]:
+        """统一增量补齐数据底座附加能力；新增能力只接入这里。"""
+        reports = []
+        for instrument_id in ("SSE:000985",):
+            missing = self.repository.missing_complete_bar_dates(
+                instrument_id, start_date, end_date
+            )
+            if not missing:
+                continue
+            reports.append(
+                self.sync_benchmark(
+                    instrument_id,
+                    missing[0],
+                    end_date,
+                    progress_callback,
+                    required_dates=missing,
+                )
+            )
+        return tuple(reports)
 
     def backfill(
         self,

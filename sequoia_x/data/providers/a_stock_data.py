@@ -28,6 +28,7 @@ from sequoia_x.data.classification import (
 from sequoia_x.data.errors import DataIntegrityError, DataNotAvailableError, DataProviderError
 from sequoia_x.data.models import (
     Adjustment,
+    BenchmarkBarsResult,
     DailyBar,
     DailySnapshotResult,
     Exchange,
@@ -42,6 +43,14 @@ TDX_BJ_FIRST_DAY = "20220506"
 TDX_MIN_PRICED = {"sh": 10_000, "sz": 3_000, "bj": 50}
 SZSE_CALENDAR_URL = "https://www.szse.cn/api/report/exchange/onepersistenthour/monthList"
 EASTMONEY_LIST_URL = "https://82.push2.eastmoney.com/api/qt/clist/get"
+TENCENT_KLINE_HOSTS = (
+    "https://web.ifzq.gtimg.cn",
+    "https://proxy.finance.qq.com/ifzqgtimg",
+    "https://ifzq.gtimg.cn",
+)
+BENCHMARK_DEFINITIONS = {
+    "SSE:000985": (Exchange.SSE, "000985", "中证全指", "sh000985"),
+}
 
 
 def _iso_day(value: str) -> str:
@@ -88,6 +97,7 @@ class AStockDataProvider:
             ProviderCapability.INSTRUMENT_DIRECTORY,
             ProviderCapability.TRADE_CALENDAR,
             ProviderCapability.ADJUSTMENT_FACTOR,
+            ProviderCapability.BENCHMARK_BARS,
         }
     )
 
@@ -171,6 +181,122 @@ class AStockDataProvider:
             checksum=hashlib.sha256(content).hexdigest(),
             metadata={"security_type_counts": dict(counts), "bytes": len(content)},
         )
+
+    def fetch_benchmark_bars(
+        self, instrument_id: str, start_date: str, end_date: str
+    ) -> BenchmarkBarsResult:
+        """从腾讯 K 线显式读取缺失的指数基准，不作为全市场盘后包降级。"""
+        try:
+            exchange, code, name, symbol = BENCHMARK_DEFINITIONS[instrument_id]
+        except KeyError as exc:
+            raise ValueError(f"不支持的基准证券：{instrument_id}") from exc
+        start = date.fromisoformat(_iso_day(start_date))
+        end = date.fromisoformat(_iso_day(end_date))
+        if start > end:
+            raise ValueError("start_date 不能晚于 end_date")
+
+        payloads: list[bytes] = []
+        source_urls: list[str] = []
+        by_date: dict[str, DailyBar] = {}
+        cursor = start
+        while cursor <= end:
+            stop = min(cursor + timedelta(days=699), end)
+            param = f"{symbol},day,{cursor.isoformat()},{stop.isoformat()},640,"
+            data, content, source_url = self._fetch_tencent_kline(param)
+            payloads.append(content)
+            if source_url not in source_urls:
+                source_urls.append(source_url)
+            node = data.get(symbol)
+            if not isinstance(node, dict) or not isinstance(node.get("day"), list):
+                raise DataIntegrityError(f"腾讯 K 线 {symbol} 缺少 day 数组")
+            for item in node["day"]:
+                if not isinstance(item, list) or len(item) < 6:
+                    raise DataIntegrityError(f"腾讯 K 线 {symbol} 行结构异常")
+                day = _iso_day(item[0])
+                if not cursor.isoformat() <= day <= stop.isoformat():
+                    raise DataIntegrityError(f"腾讯 K 线返回越界日期：{day}")
+                if day in by_date:
+                    raise DataIntegrityError(f"腾讯 K 线重复返回日期：{day}")
+                try:
+                    open_, close, high, low, volume = (float(value) for value in item[1:6])
+                except (TypeError, ValueError) as exc:
+                    raise DataIntegrityError(f"腾讯 K 线 {day} 数值异常") from exc
+                values = (open_, close, high, low, volume)
+                if not all(math.isfinite(value) for value in values):
+                    raise DataIntegrityError(f"腾讯 K 线 {day} 出现非有限数值")
+                if min(open_, high, low, close) <= 0 or volume < 0:
+                    raise DataIntegrityError(f"腾讯 K 线 {day} 价格或成交量非法")
+                by_date[day] = DailyBar(
+                    instrument_id=instrument_id,
+                    trade_date=day,
+                    open=open_,
+                    high=high,
+                    low=low,
+                    close=close,
+                    previous_close=None,
+                    volume=volume,
+                    amount=0.0,
+                    provider="tencent",
+                    adjustment=Adjustment.RAW,
+                    raw_payload={"row": item, "amount_unavailable": True},
+                )
+            cursor = stop + timedelta(days=1)
+        if not by_date:
+            raise DataNotAvailableError(f"腾讯没有返回 {instrument_id} 基准行情")
+        previous_close = None
+        bars = []
+        for day in sorted(by_date):
+            bar = by_date[day]
+            bars.append(
+                DailyBar(
+                    **{
+                        **bar.__dict__,
+                        "previous_close": previous_close,
+                    }
+                )
+            )
+            previous_close = bar.close
+        instrument = InstrumentRecord(
+            exchange=exchange,
+            security_code=code,
+            name=name,
+            security_type=SecurityType.INDEX,
+            source="tencent",
+            source_identifier=symbol,
+            raw_payload={"symbol": symbol, "source": "腾讯K线"},
+        )
+        return BenchmarkBarsResult(
+            instrument=instrument,
+            start_date=start.isoformat(),
+            end_date=end.isoformat(),
+            provider="tencent",
+            source_url=" | ".join(source_urls),
+            bars=tuple(bars),
+            checksum=hashlib.sha256(b"".join(payloads)).hexdigest(),
+        )
+
+    def _fetch_tencent_kline(self, param: str) -> tuple[dict[str, Any], bytes, str]:
+        errors = []
+        for host in TENCENT_KLINE_HOSTS:
+            url = host + "/appstock/app/fqkline/get"
+            try:
+                response = self._get(
+                    url,
+                    params={"param": param},
+                    headers={"Referer": "https://gu.qq.com/"},
+                    timeout=(8, 20),
+                )
+                payload = response.json()
+            except (DataProviderError, requests.JSONDecodeError) as exc:
+                errors.append(f"{host}: {exc}")
+                continue
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict) and data:
+                return data, response.content, str(getattr(response, "url", url))
+            if isinstance(payload, dict) and payload.get("msg") == "param error":
+                raise DataNotAvailableError(f"腾讯 K 线参数或代码无效：{param}")
+            errors.append(f"{host}: 空响应")
+        raise DataProviderError("腾讯 K 线三个入口均不可用：" + "；".join(errors))
 
     @staticmethod
     def _parse_package(content: bytes, ymd: str) -> list[dict[str, Any]]:

@@ -72,6 +72,7 @@ def write_research_report(
                 "data_exclusions": result.data_exclusions,
                 "calculation_errors": list(result.calculation_errors),
                 "risk_note": result.risk_note,
+                "candidate_scores": dict(result.candidate_scores),
             }
             for result in results
         },

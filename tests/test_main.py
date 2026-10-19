@@ -108,7 +108,7 @@ def test_default_backfill_stops_at_yesterday() -> None:
     assert run_backfill.call_args.args[-1] == (date.today() - timedelta(days=1)).isoformat()
 
 
-def test_daily_sync_enables_incremental_quality_processing() -> None:
+def test_daily_sync_routes_to_unified_data_orchestrator() -> None:
     settings = SimpleNamespace(db_path="data/test-v3.db", start_date="2024-01-01")
     repository = Mock()
     service = Mock()
@@ -117,17 +117,57 @@ def test_daily_sync_enables_incremental_quality_processing() -> None:
         patch.object(sys, "argv", ["main.py", "data", "sync", "--days", "7"]),
         patch.object(main_module, "get_settings", return_value=settings),
         patch.object(main_module, "_components", return_value=(repository, service)),
-        patch.object(main_module, "_run_backfill", return_value=0) as run_backfill,
+        patch.object(main_module, "_run_data_sync", return_value=0) as run_sync,
         pytest.raises(SystemExit) as exc_info,
     ):
         main_module.main()
 
     assert exc_info.value.code == 0
-    assert run_backfill.call_args.kwargs == {"incremental_quality": True}
-    assert run_backfill.call_args.args[-2:] == (
+    assert run_sync.call_args.args[-2:] == (
         (date.today() - timedelta(days=7)).isoformat(),
         (date.today() - timedelta(days=1)).isoformat(),
     )
+
+
+def test_unified_data_sync_updates_supplemental_data_after_market_success() -> None:
+    settings = SimpleNamespace(db_path="data/test-v3.db", start_date="2024-01-02")
+    repository = Mock()
+    repository.audit.return_value = SimpleNamespace(latest_complete_date="2026-10-14")
+    service = Mock()
+    service.sync_supplemental_data.return_value = ()
+
+    with (
+        patch.object(main_module, "_run_backfill", return_value=0) as run_backfill,
+        patch.object(main_module, "BenchmarkSyncConsole"),
+    ):
+        status = main_module._run_data_sync(
+            settings, repository, service, "2026-10-01", "2026-10-18"
+        )
+
+    assert status == 0
+    run_backfill.assert_called_once_with(
+        settings,
+        repository,
+        service,
+        "2026-10-01",
+        "2026-10-18",
+        incremental_quality=True,
+    )
+    service.sync_supplemental_data.assert_called_once()
+
+
+def test_unified_data_sync_stops_before_supplemental_data_on_market_failure() -> None:
+    settings = SimpleNamespace(db_path="data/test-v3.db", start_date="2024-01-02")
+    repository = Mock()
+    service = Mock()
+
+    with patch.object(main_module, "_run_backfill", return_value=1):
+        status = main_module._run_data_sync(
+            settings, repository, service, "2026-10-01", "2026-10-18"
+        )
+
+    assert status == 1
+    service.sync_supplemental_data.assert_not_called()
 
 
 def test_scan_only_routes_to_v3_research_scan() -> None:
@@ -267,6 +307,45 @@ def test_backtest_run_dispatches_explicit_configuration() -> None:
         minimum_commission=5.0,
         slippage_bps=0.0,
         output_path="reports/rps.json",
+        json_output=False,
+    )
+
+
+def test_backtest_audit_json_mode_dispatches_without_human_progress() -> None:
+    settings = SimpleNamespace(db_path="data/test-v3.db", start_date="2024-01-01")
+    repository = Mock()
+    service = Mock()
+
+    with (
+        patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "backtest",
+                "audit",
+                "--start",
+                "2025-01-01",
+                "--end",
+                "2025-03-31",
+                "--json",
+            ],
+        ),
+        patch.object(main_module, "get_settings", return_value=settings),
+        patch.object(main_module, "_components", return_value=(repository, service)),
+        patch.object(main_module, "_run_backtest_audit", return_value=0) as run_audit,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main_module.main()
+
+    assert exc_info.value.code == 0
+    run_audit.assert_called_once_with(
+        settings,
+        repository,
+        start_date="2025-01-01",
+        end_date="2025-03-31",
+        history_bars=121,
+        json_output=True,
     )
 
 

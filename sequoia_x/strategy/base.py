@@ -17,6 +17,7 @@ class StrategyResult:
     data_exclusions: int
     calculation_errors: tuple[str, ...] = ()
     risk_note: str | None = None
+    candidate_scores: tuple[tuple[str, float], ...] = ()
 
 
 class BaseStrategy(ABC):
@@ -28,23 +29,33 @@ class BaseStrategy(ABC):
     risk_note: str | None = None
 
     @abstractmethod
-    def run(self, snapshot: ResearchSnapshot) -> StrategyResult:
-        ...
+    def run(self, snapshot: ResearchSnapshot) -> StrategyResult: ...
 
     def _result(
         self,
         snapshot: ResearchSnapshot,
         selected: list[str],
         errors: list[str] | None = None,
+        scores: dict[str, float] | None = None,
     ) -> StrategyResult:
+        ordered = (
+            sorted(selected, key=lambda instrument_id: (-scores[instrument_id], instrument_id))
+            if scores
+            else sorted(selected)
+        )
         return StrategyResult(
             strategy_key=self.strategy_key,
             as_of_date=snapshot.as_of_date,
-            selected_instruments=tuple(sorted(selected)),
+            selected_instruments=tuple(ordered),
             rule_basis=self.rule_basis,
             input_instruments=snapshot.requested_instruments,
             eligible_instruments=snapshot.eligible_instruments,
             data_exclusions=len(snapshot.exclusions),
             calculation_errors=tuple(errors or ()),
             risk_note=self.risk_note,
+            candidate_scores=tuple(
+                (instrument_id, round(scores[instrument_id], 4)) for instrument_id in ordered
+            )
+            if scores
+            else (),
         )

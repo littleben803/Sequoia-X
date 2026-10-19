@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from bisect import bisect_right
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date
 from types import MappingProxyType
 
@@ -14,6 +17,16 @@ from sequoia_x.data.research import (
     ResearchExclusion,
     ResearchSnapshot,
 )
+
+
+@dataclass(frozen=True)
+class BacktestAuditProgress:
+    """回测区间审计的结构化进度事件。"""
+
+    phase: str
+    message: str
+    step: int
+    total_steps: int = 4
 
 
 class BacktestDataService:
@@ -35,9 +48,7 @@ class BacktestDataService:
         self._lifecycles: tuple[tuple[str, str, str | None], ...] = ()
         self._raw_bars: dict[str, tuple[tuple, ...]] = {}
         self._raw_bar_dates: dict[str, tuple[str, ...]] = {}
-        self._factor_evidence: dict[
-            str, tuple[tuple[str, float, str, str, str], ...]
-        ] = {}
+        self._factor_evidence: dict[str, tuple[tuple[str, float, str, str, str], ...]] = {}
 
     def _audit(self) -> V3AuditReport:
         if self._base_audit is None:
@@ -59,6 +70,25 @@ class BacktestDataService:
                 (start_date,),
             ).fetchall()
         return tuple(row[0] for row in rows if row[0] is not None)
+
+    def benchmark_closes(
+        self, instrument_id: str, dates: tuple[str, ...]
+    ) -> tuple[tuple[str, float], ...]:
+        """读取指定完整交易日上的 canonical 基准收盘价。"""
+        if not dates:
+            return ()
+        requested = set(dates)
+        with self.repository.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT trade_date, close
+                FROM daily_bars_canonical
+                WHERE instrument_id=? AND trade_date BETWEEN ? AND ?
+                ORDER BY trade_date
+                """,
+                (instrument_id, dates[0], dates[-1]),
+            ).fetchall()
+        return tuple((row[0], float(row[1])) for row in rows if row[0] in requested)
 
     def prepare_snapshots(self, dates: tuple[str, ...], history_bars: int) -> None:
         """一次读取回测区间行情、证券生命周期和因子证据。"""
@@ -91,10 +121,7 @@ class BacktestDataService:
     def build_snapshot(self, as_of_date: str, history_bars: int) -> ResearchSnapshot:
         """构造指定历史日快照；缓存不改变数据或质量语义。"""
         key = (as_of_date, history_bars)
-        if (
-            as_of_date in self._prepared_dates
-            and history_bars == self._prepared_history_bars
-        ):
+        if as_of_date in self._prepared_dates and history_bars == self._prepared_history_bars:
             return self._build_prepared_snapshot(as_of_date, history_bars)
         if key not in self._snapshot_cache:
             self._snapshot_cache[key] = self.research.build_snapshot(
@@ -105,9 +132,7 @@ class BacktestDataService:
             )
         return self._snapshot_cache[key]
 
-    def _build_prepared_snapshot(
-        self, as_of_date: str, history_bars: int
-    ) -> ResearchSnapshot:
+    def _build_prepared_snapshot(self, as_of_date: str, history_bars: int) -> ResearchSnapshot:
         universe = tuple(
             instrument_id
             for instrument_id, valid_from, valid_to in self._lifecycles
@@ -128,9 +153,7 @@ class BacktestDataService:
                 exclusions.append(ResearchExclusion(instrument_id, "NO_BAR_ON_RESEARCH_DATE"))
                 continue
             try:
-                adjusted[instrument_id] = self.research.apply_qfq(
-                    instrument_id, bars, factors
-                )
+                adjusted[instrument_id] = self.research.apply_qfq(instrument_id, bars, factors)
             except ResearchDataError as error:
                 exclusions.append(ResearchExclusion(instrument_id, str(error)))
 
@@ -172,32 +195,94 @@ class BacktestDataService:
         start_date: str,
         end_date: str,
         history_bars: int,
+        progress_callback: Callable[[BacktestAuditProgress], None] | None = None,
     ) -> dict:
         """只读检查区间边界及完整交易日数量。"""
-        dates = tuple(
-            day for day in self.complete_trading_dates(start_date) if day <= end_date
+        started = time.monotonic()
+        self._emit_audit_progress(
+            progress_callback,
+            "LOADING_DATES",
+            "正在查询区间内的完整交易日",
+            1,
         )
+        dates = tuple(day for day in self.complete_trading_dates(start_date) if day <= end_date)
         boundary_dates = tuple(dict.fromkeys((dates[0], dates[-1]))) if dates else ()
-        audits = tuple(
-            self.research.audit_snapshot(
-                history_bars=history_bars,
-                as_of_date=day,
-                minimum_coverage=self.minimum_coverage,
-                base_audit=self._audit(),
-            )
-            for day in boundary_dates
+        self._emit_audit_progress(
+            progress_callback,
+            "AUDITING_BASE",
+            "正在审计全库批次、行情缺口和异常数据",
+            2,
         )
+        base_audit = self._audit()
+        audits = []
+        for index, day in enumerate(boundary_dates, 1):
+            self._emit_audit_progress(
+                progress_callback,
+                "AUDITING_BOUNDARY",
+                f"正在检查边界快照 {index}/{len(boundary_dates)}：{day}",
+                3,
+            )
+            audits.append(
+                self.research.audit_snapshot(
+                    history_bars=history_bars,
+                    as_of_date=day,
+                    minimum_coverage=self.minimum_coverage,
+                    base_audit=base_audit,
+                )
+            )
         problems = [problem for audit in audits for problem in audit.problems]
         if not dates:
             problems.append("请求区间内没有完整全市场交易日")
-        return {
-            "ready": bool(dates) and all(audit.ready for audit in audits),
+        benchmark_names = {
+            "SSE:000300": "沪深300",
+            "SSE:000985": "中证全指",
+        }
+        benchmark_audits = []
+        for instrument_id, name in benchmark_names.items():
+            available = dict(self.benchmark_closes(instrument_id, dates))
+            missing = tuple(day for day in dates if day not in available)
+            benchmark_audits.append(
+                {
+                    "instrument_id": instrument_id,
+                    "name": name,
+                    "available_days": len(available),
+                    "required_days": len(dates),
+                    "missing_days": len(missing),
+                    "first_missing_date": missing[0] if missing else None,
+                }
+            )
+            if missing:
+                problems.append(f"基准 {name} 缺少 {len(missing)} 个完整交易日行情")
+        report = {
+            "ready": (
+                bool(dates)
+                and all(audit.ready for audit in audits)
+                and all(item["missing_days"] == 0 for item in benchmark_audits)
+            ),
             "start_date": start_date,
             "end_date": end_date,
             "complete_trading_days": len(dates),
             "first_complete_date": dates[0] if dates else None,
             "last_complete_date": dates[-1] if dates else None,
             "boundary_audits": [audit.to_dict() for audit in audits],
+            "benchmark_audits": benchmark_audits,
             "problems": problems,
+            "elapsed_seconds": time.monotonic() - started,
         }
+        self._emit_audit_progress(
+            progress_callback,
+            "COMPLETE",
+            "审计完成，正在整理 Summary",
+            4,
+        )
+        return report
 
+    @staticmethod
+    def _emit_audit_progress(
+        callback: Callable[[BacktestAuditProgress], None] | None,
+        phase: str,
+        message: str,
+        step: int,
+    ) -> None:
+        if callback:
+            callback(BacktestAuditProgress(phase=phase, message=message, step=step))

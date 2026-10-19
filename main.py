@@ -11,7 +11,7 @@ from datetime import date, timedelta
 
 from sequoia_x.backtest.data import BacktestDataService
 from sequoia_x.backtest.engine import BacktestEngine
-from sequoia_x.backtest.models import BacktestConfig
+from sequoia_x.backtest.models import BacktestConfig, BacktestProgress
 from sequoia_x.backtest.reporting import write_backtest_report
 from sequoia_x.core.config import Settings, get_settings
 from sequoia_x.core.logger import get_logger
@@ -25,6 +25,9 @@ from sequoia_x.data.router import ProviderRouter
 from sequoia_x.data.service import DataApplicationService
 from sequoia_x.reporting.console import (
     AdjustmentFactorConsole,
+    BacktestAuditConsole,
+    BacktestRunConsole,
+    BenchmarkSyncConsole,
     DataConsole,
     ResearchScanConsole,
 )
@@ -83,6 +86,12 @@ def _parse_args() -> argparse.Namespace:
     backtest_audit.add_argument("--start", required=True, help="起始日期 YYYY-MM-DD")
     backtest_audit.add_argument("--end", required=True, help="结束日期 YYYY-MM-DD")
     backtest_audit.add_argument("--history-bars", type=int, default=121, help="历史窗口")
+    backtest_audit.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="关闭动态进度并输出机器可读 JSON",
+    )
     backtest_run = backtest_commands.add_parser("run", help="运行逐日信号与前瞻收益评价")
     backtest_run.add_argument("--start", required=True, help="起始日期 YYYY-MM-DD")
     backtest_run.add_argument("--end", required=True, help="结束日期 YYYY-MM-DD")
@@ -105,17 +114,19 @@ def _parse_args() -> argparse.Namespace:
         "--exit-retry-days", type=int, default=5, help="卖出受阻后的尾部重试交易日"
     )
     backtest_run.add_argument("--max-positions", type=int, default=10, help="最大同时持仓数")
-    backtest_run.add_argument(
-        "--commission-rate", type=float, default=0.0003, help="双边佣金率"
-    )
-    backtest_run.add_argument(
-        "--minimum-commission", type=float, default=5.0, help="单笔最低佣金"
-    )
+    backtest_run.add_argument("--commission-rate", type=float, default=0.0003, help="双边佣金率")
+    backtest_run.add_argument("--minimum-commission", type=float, default=5.0, help="单笔最低佣金")
     backtest_run.add_argument("--slippage-bps", type=float, default=0.0, help="单边滑点基点")
     backtest_run.add_argument(
         "--output",
         default="reports/backtest-latest.json",
         help="本地 JSON 报告路径",
+    )
+    backtest_run.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="关闭动态进度和 Summary，仅输出机器可读结果",
     )
     return parser.parse_args()
 
@@ -161,6 +172,41 @@ def _run_backfill(
         return 1
     if report.degraded_dates:
         logger.warning("任务包含降级部分数据，不代表全品种盘后数据完整")
+    return 0
+
+
+def _run_data_sync(
+    settings: Settings,
+    repository: MarketDataRepository,
+    service: DataApplicationService,
+    start_date: str,
+    end_date: str,
+) -> int:
+    status = _run_backfill(
+        settings,
+        repository,
+        service,
+        start_date,
+        end_date,
+        incremental_quality=True,
+    )
+    if status != 0:
+        return status
+    latest_complete = repository.audit().latest_complete_date
+    if latest_complete is None:
+        raise ValueError("本地尚无完整全市场交易日，无法同步附加数据")
+    view = BenchmarkSyncConsole()
+    view.show_header("统一附加数据", settings.start_date, latest_complete)
+    reports = service.sync_supplemental_data(
+        settings.start_date,
+        latest_complete,
+        progress_callback=view.update,
+    )
+    if reports:
+        for report in reports:
+            view.show_summary(report)
+    else:
+        view.show_up_to_date(latest_complete)
     return 0
 
 
@@ -325,6 +371,7 @@ def _run_backtest_audit(
     start_date: str,
     end_date: str,
     history_bars: int,
+    json_output: bool = False,
 ) -> int:
     date.fromisoformat(start_date)
     date.fromisoformat(end_date)
@@ -332,15 +379,32 @@ def _run_backtest_audit(
         raise ValueError("结束日期不能早于开始日期")
     if history_bars < 121:
         raise ValueError("历史窗口不能少于 121 个交易日")
-    report = BacktestDataService(
+    service = BacktestDataService(
         repository,
         minimum_coverage=settings.minimum_latest_coverage,
-    ).audit_range(
-        start_date=start_date,
-        end_date=end_date,
-        history_bars=history_bars,
     )
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    view = None if json_output else BacktestAuditConsole()
+    if view:
+        view.show_header(
+            start_date=start_date,
+            end_date=end_date,
+            history_bars=history_bars,
+            db_path=repository.db_path,
+        )
+    try:
+        report = service.audit_range(
+            start_date=start_date,
+            end_date=end_date,
+            history_bars=history_bars,
+            progress_callback=view.update if view else None,
+        )
+    finally:
+        if view:
+            view.stop()
+    if json_output:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        view.show_summary(report)
     return 0 if report["ready"] else 1
 
 
@@ -361,7 +425,9 @@ def _run_backtest(
     minimum_commission: float,
     slippage_bps: float,
     output_path: str,
+    json_output: bool = False,
 ) -> int:
+    started = time.monotonic()
     keys = _strategy_keys(settings, requested_strategies)
     config = BacktestConfig(
         start_date=start_date,
@@ -382,40 +448,85 @@ def _run_backtest(
         repository,
         minimum_coverage=config.minimum_coverage,
     )
-    result = BacktestEngine(data).run(config)
-    report_path = write_backtest_report(
-        result=result,
-        database_path=repository.db_path,
-        output_path=output_path,
-    )
-    print(
-        json.dumps(
-            {
-                "status": "COMPLETE",
-                "start_date": config.start_date,
-                "end_date": config.end_date,
-                "signal_dates": len(result.signal_dates),
-                "signals": len(result.signals),
-                "outcomes": len(result.outcomes),
-                "calculation_errors": len(result.calculation_errors),
-                "portfolios": {
-                    item.strategy_key: {
-                        "final_equity": item.final_equity,
-                        "total_return": item.total_return,
-                        "max_drawdown": item.max_drawdown,
-                        "filled_buys": item.filled_buys,
-                        "filled_sells": item.filled_sells,
-                        "open_positions": len(item.open_positions),
-                    }
-                    for item in result.portfolios
-                },
-                "report_path": str(report_path),
-                "risk_boundary": "历史日线模拟，不代表实盘可成交结果或未来收益。",
-            },
-            ensure_ascii=False,
-            indent=2,
+    view = None if json_output else BacktestRunConsole()
+    if view:
+        view.show_header(config, repository.db_path, output_path)
+    try:
+        result = BacktestEngine(data).run(
+            config,
+            progress_callback=view.update if view else None,
         )
-    )
+        report_path = write_backtest_report(
+            result=result,
+            database_path=repository.db_path,
+            output_path=output_path,
+        )
+        if view:
+            view.update(
+                BacktestProgress(
+                    phase="COMPLETE",
+                    message="报告已安全写入，正在整理 Summary",
+                    step=6,
+                    completed=1,
+                    total=1,
+                    signals=len(result.signals),
+                    outcomes=len(result.outcomes),
+                )
+            )
+    finally:
+        if view:
+            view.stop()
+    elapsed_seconds = time.monotonic() - started
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "status": "COMPLETE",
+                    "start_date": config.start_date,
+                    "end_date": config.end_date,
+                    "signal_dates": len(result.signal_dates),
+                    "signals": len(result.signals),
+                    "outcomes": len(result.outcomes),
+                    "calculation_errors": len(result.calculation_errors),
+                    "portfolios": {
+                        item.strategy_key: {
+                            "final_equity": item.final_equity,
+                            "total_return": item.total_return,
+                            "annualized_return": item.annualized_return,
+                            "sharpe_ratio": item.sharpe_ratio,
+                            "sortino_ratio": item.sortino_ratio,
+                            "max_drawdown": item.max_drawdown,
+                            "trade_win_rate": item.trade_win_rate,
+                            "profit_loss_ratio": item.profit_loss_ratio,
+                            "annualized_turnover": item.annualized_turnover,
+                            "filled_buys": item.filled_buys,
+                            "filled_sells": item.filled_sells,
+                            "open_positions": len(item.open_positions),
+                        }
+                        for item in result.portfolios
+                    },
+                    "benchmarks": {
+                        item.instrument_id: {
+                            "name": item.name,
+                            "total_return": item.total_return,
+                            "annualized_return": item.annualized_return,
+                            "max_drawdown": item.max_drawdown,
+                        }
+                        for item in result.benchmarks
+                    },
+                    "report_path": str(report_path),
+                    "risk_boundary": "历史日线模拟，不代表实盘可成交结果或未来收益。",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        view.show_summary(
+            result=result,
+            report_path=report_path,
+            elapsed_seconds=elapsed_seconds,
+        )
     return 0
 
 
@@ -476,6 +587,7 @@ def main() -> None:
                         start_date=args.start,
                         end_date=args.end,
                         history_bars=args.history_bars,
+                        json_output=args.json_output,
                     )
                 )
             if args.backtest_command == "run":
@@ -496,6 +608,7 @@ def main() -> None:
                         minimum_commission=args.minimum_commission,
                         slippage_bps=args.slippage_bps,
                         output_path=args.output,
+                        json_output=args.json_output,
                     )
                 )
             logger.info("`python main.py backtest --help` 查看回测命令")
@@ -512,13 +625,12 @@ def main() -> None:
                 raise ValueError("--days 必须大于 0")
             start = (today - timedelta(days=args.days)).isoformat()
             raise SystemExit(
-                _run_backfill(
+                _run_data_sync(
                     settings,
                     repository,
                     service,
                     start,
                     latest_default_end.isoformat(),
-                    incremental_quality=True,
                 )
             )
         if args.data_command == "audit":

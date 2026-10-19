@@ -16,6 +16,7 @@ from sequoia_x.data.models import (
     Adjustment,
     AdjustmentFactorRecord,
     BatchStatus,
+    BenchmarkBarsResult,
     DailySnapshotResult,
     DailyStatus,
     Exchange,
@@ -46,6 +47,27 @@ class MarketDataRepository:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
         return conn
+
+    def missing_complete_bar_dates(
+        self, instrument_id: str, start_date: str, end_date: str
+    ) -> tuple[str, ...]:
+        """返回完整全市场交易日中指定证券尚未落库的日期。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT b.trade_date
+                FROM ingestion_batches AS b
+                LEFT JOIN daily_bars_canonical AS d
+                  ON d.instrument_id=? AND d.trade_date=b.trade_date
+                WHERE b.capability='DAILY_SNAPSHOT'
+                  AND b.status='COMPLETE'
+                  AND b.trade_date BETWEEN ? AND ?
+                  AND d.trade_date IS NULL
+                ORDER BY b.trade_date
+                """,
+                (instrument_id, start_date, end_date),
+            ).fetchall()
+        return tuple(row[0] for row in rows)
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
@@ -585,6 +607,109 @@ class MarketDataRepository:
         )
         if no_trade_records:
             self.save_daily_status(no_trade_records)
+        return inserted, updated
+
+    def save_benchmark_bars(self, batch_id: str, result: BenchmarkBarsResult) -> tuple[int, int]:
+        """原子保存显式基准行情，不改变全市场 DAILY_SNAPSHOT 完整性。"""
+        self.upsert_instruments((result.instrument,), result.start_date)
+        now = self._now()
+        inserted = updated = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for bar in result.bars:
+                existing = conn.execute(
+                    """
+                    SELECT id FROM daily_bars_raw
+                    WHERE instrument_id=? AND trade_date=? AND provider=? AND adjustment=?
+                    """,
+                    (bar.instrument_id, bar.trade_date, bar.provider, bar.adjustment),
+                ).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO daily_bars_raw
+                        (instrument_id, trade_date, open, high, low, close, previous_close,
+                         volume, amount, provider, source_batch_id, adjustment, currency,
+                         raw_payload_json, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(instrument_id,trade_date,provider,adjustment) DO UPDATE SET
+                        open=excluded.open, high=excluded.high, low=excluded.low,
+                        close=excluded.close, previous_close=excluded.previous_close,
+                        volume=excluded.volume, amount=excluded.amount,
+                        source_batch_id=excluded.source_batch_id,
+                        raw_payload_json=excluded.raw_payload_json,
+                        fetched_at=excluded.fetched_at
+                    """,
+                    (
+                        bar.instrument_id,
+                        bar.trade_date,
+                        bar.open,
+                        bar.high,
+                        bar.low,
+                        bar.close,
+                        bar.previous_close,
+                        bar.volume,
+                        bar.amount,
+                        bar.provider,
+                        batch_id,
+                        bar.adjustment,
+                        bar.currency,
+                        json.dumps(bar.raw_payload, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                inserted += existing is None
+                updated += existing is not None
+            conn.execute(
+                """
+                INSERT INTO daily_bars_canonical
+                    (instrument_id, trade_date, open, high, low, close, previous_close,
+                     volume, amount, selected_provider, source_raw_bar_id,
+                     quality_status, updated_at)
+                SELECT instrument_id, trade_date, open, high, low, close, previous_close,
+                       volume, amount, provider, id, 'BENCHMARK_RAW', ?
+                FROM daily_bars_raw
+                WHERE source_batch_id=?
+                ON CONFLICT(instrument_id,trade_date) DO UPDATE SET
+                    open=excluded.open, high=excluded.high, low=excluded.low,
+                    close=excluded.close, previous_close=excluded.previous_close,
+                    volume=excluded.volume, amount=excluded.amount,
+                    selected_provider=excluded.selected_provider,
+                    source_raw_bar_id=excluded.source_raw_bar_id,
+                    quality_status=excluded.quality_status,
+                    updated_at=excluded.updated_at
+                WHERE daily_bars_canonical.selected_provider=excluded.selected_provider
+                """,
+                (now, batch_id),
+            )
+            conn.execute(
+                """
+                UPDATE ingestion_batches SET
+                    finished_at=?, status='COMPLETE', requested_count=?, received_count=?,
+                    valid_count=?, inserted_count=?, updated_count=?, source_url=?,
+                    checksum=?, metadata_json=?
+                WHERE batch_id=?
+                """,
+                (
+                    now,
+                    len(result.bars),
+                    len(result.bars),
+                    len(result.bars),
+                    inserted,
+                    updated,
+                    result.source_url,
+                    result.checksum,
+                    json.dumps(
+                        {
+                            "instrument_id": result.instrument.instrument_id,
+                            "start_date": result.start_date,
+                            "end_date": result.end_date,
+                            "amount_unavailable": True,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    batch_id,
+                ),
+            )
         return inserted, updated
 
     def save_adjustment_factors(

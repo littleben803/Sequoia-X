@@ -7,7 +7,12 @@ from types import MappingProxyType
 import pytest
 
 from sequoia_x.backtest.engine import BacktestEngine
-from sequoia_x.backtest.models import BacktestConfig
+from sequoia_x.backtest.models import (
+    BacktestConfig,
+    EquityPoint,
+    OrderRecord,
+    SignalRecord,
+)
 from sequoia_x.backtest.portfolio import PortfolioSimulator
 from sequoia_x.data.models import V3AuditReport
 from sequoia_x.data.research import ResearchBar, ResearchSnapshot
@@ -69,12 +74,15 @@ class _FakeDataService:
     def build_snapshot(self, as_of_date: str, history_bars: int) -> ResearchSnapshot:
         self.requested_dates.append(as_of_date)
         snapshot = self.snapshots[as_of_date]
-        assert all(
-            bar.trade_date <= as_of_date
-            for bars in snapshot.bars.values()
-            for bar in bars
-        )
+        assert all(bar.trade_date <= as_of_date for bars in snapshot.bars.values() for bar in bars)
         return snapshot
+
+    def benchmark_closes(
+        self, instrument_id: str, dates: tuple[str, ...]
+    ) -> tuple[tuple[str, float], ...]:
+        assert instrument_id in {"SSE:000300", "SSE:000985"}
+        base = 100.0 if instrument_id == "SSE:000300" else 200.0
+        return tuple((day, base + index) for index, day in enumerate(dates))
 
 
 class _SelectEveryDayStrategy(BaseStrategy):
@@ -102,10 +110,11 @@ def test_backtest_uses_only_signal_date_snapshot_and_computes_forward_returns() 
         exit_retry_days=0,
     )
 
+    events = []
     result = BacktestEngine(
         data,
         strategy_factory=lambda _key: _SelectEveryDayStrategy(),
-    ).run(config)
+    ).run(config, progress_callback=events.append)
 
     assert [item.as_of_date for item in result.signals] == ["2026-01-05"]
     assert result.signals[0].signal_close == 10.0
@@ -116,6 +125,15 @@ def test_backtest_uses_only_signal_date_snapshot_and_computes_forward_returns() 
         "2026-01-06",
         "2026-01-07",
     ]
+    assert {event.phase for event in events} == {
+        "PLANNING",
+        "PREPARING",
+        "SIGNALS",
+        "OUTCOMES",
+        "PORTFOLIO",
+    }
+    assert events[-1].phase == "PORTFOLIO"
+    assert events[-1].completed == events[-1].total
 
 
 def test_backtest_records_missing_forward_bar_instead_of_fabricating_return() -> None:
@@ -235,6 +253,17 @@ def test_portfolio_enters_next_open_and_exits_after_fixed_holding_period() -> No
     assert sell.stamp_duty == pytest.approx(54.0)
     assert portfolio.final_equity == pytest.approx(108_883.9)
     assert portfolio.open_positions == ()
+    assert portfolio.closed_trades[0].net_profit == pytest.approx(8_883.9)
+    assert portfolio.trade_win_rate == 1.0
+    assert portfolio.average_win == pytest.approx(8_883.9)
+    assert portfolio.average_loss is None
+    assert portfolio.profit_loss_ratio is None
+    assert portfolio.interval_turnover is not None
+    assert portfolio.annualized_turnover is not None
+    assert result.benchmarks[0].instrument_id == "SSE:000300"
+    assert result.benchmarks[0].total_return == pytest.approx(0.02)
+    assert result.benchmarks[1].instrument_id == "SSE:000985"
+    assert result.benchmarks[1].total_return == pytest.approx(0.01)
 
 
 def test_one_price_up_lock_rejects_buy_without_fabricating_fill() -> None:
@@ -274,6 +303,143 @@ def test_one_price_up_lock_rejects_buy_without_fabricating_fill() -> None:
 def test_stamp_duty_uses_official_2023_reduction_effective_date() -> None:
     assert PortfolioSimulator.stamp_duty_rate("2023-08-27") == 0.001
     assert PortfolioSimulator.stamp_duty_rate("2023-08-28") == 0.0005
+
+
+def test_portfolio_metrics_use_closed_net_trades_and_downside_returns() -> None:
+    orders = [
+        OrderRecord(
+            "test",
+            "2025-01-02",
+            "2025-01-01",
+            "A",
+            "BUY",
+            "FILLED",
+            None,
+            100,
+            10.0,
+            1_000.0,
+            0.0,
+            0.0,
+        ),
+        OrderRecord(
+            "test",
+            "2025-01-03",
+            "2025-01-01",
+            "A",
+            "SELL",
+            "FILLED",
+            None,
+            100,
+            11.0,
+            1_100.0,
+            0.0,
+            0.0,
+        ),
+        OrderRecord(
+            "test",
+            "2025-01-06",
+            "2025-01-05",
+            "B",
+            "BUY",
+            "FILLED",
+            None,
+            100,
+            10.0,
+            1_000.0,
+            0.0,
+            0.0,
+        ),
+        OrderRecord(
+            "test",
+            "2025-01-07",
+            "2025-01-05",
+            "B",
+            "SELL",
+            "FILLED",
+            None,
+            100,
+            9.0,
+            900.0,
+            0.0,
+            0.0,
+        ),
+    ]
+    curve = [
+        EquityPoint("2025-01-02", 1_000.0, 0.0, 1_000.0, 0),
+        EquityPoint("2025-01-03", 1_100.0, 0.0, 1_100.0, 0),
+        EquityPoint("2025-01-07", 1_000.0, 0.0, 1_000.0, 0),
+    ]
+    config = BacktestConfig(
+        start_date="2025-01-02",
+        end_date="2025-01-07",
+        strategy_keys=("test",),
+        initial_cash=1_000.0,
+        commission_rate=0.0,
+        minimum_commission=0.0,
+    )
+
+    result = PortfolioSimulator()._result("test", config, 1_000.0, {}, orders, curve)
+
+    assert result.trade_win_rate == 0.5
+    assert result.average_win == pytest.approx(100.0)
+    assert result.average_loss == pytest.approx(-100.0)
+    assert result.profit_loss_ratio == pytest.approx(1.0)
+    assert result.sortino_ratio is not None
+    assert result.interval_turnover == pytest.approx(4_000 / (3_100 / 3))
+    assert result.annual_returns[0].return_rate == pytest.approx(0.0)
+    assert result.annual_returns[0].is_partial is True
+
+
+def test_portfolio_prefers_higher_candidate_score_when_capacity_is_limited() -> None:
+    stronger = "SZSE:000001"
+    snapshots = {}
+    for day, close in (
+        ("2026-01-05", 10.0),
+        ("2026-01-06", 11.0),
+        ("2026-01-07", 12.0),
+    ):
+        base = _snapshot(day, close)
+        weaker_bar = base.bars["SSE:600001"][0]
+        stronger_bar = replace(weaker_bar, instrument_id=stronger)
+        snapshots[day] = replace(
+            base,
+            bars=MappingProxyType({"SSE:600001": (weaker_bar,), stronger: (stronger_bar,)}),
+            requested_instruments=2,
+            eligible_instruments=2,
+        )
+    signals = tuple(
+        SignalRecord(
+            strategy_key="test",
+            as_of_date="2026-01-05",
+            instrument_id=instrument_id,
+            signal_close=10.0,
+            rule_basis=("测试评分",),
+            risk_note=None,
+            snapshot_coverage=1.0,
+            candidate_score=score,
+        )
+        for instrument_id, score in (("SSE:600001", 10.0), (stronger, 90.0))
+    )
+    config = BacktestConfig(
+        start_date="2026-01-05",
+        end_date="2026-01-05",
+        strategy_keys=("test",),
+        horizons=(1,),
+        holding_period=1,
+        exit_retry_days=0,
+        max_positions=1,
+    )
+
+    result = PortfolioSimulator().run(
+        config=config,
+        dates=tuple(snapshots),
+        signal_dates=("2026-01-05",),
+        signals=signals,
+        snapshot_source=snapshots.__getitem__,
+    )[0]
+
+    filled_buy = next(order for order in result.orders if order.side == "BUY")
+    assert filled_buy.instrument_id == stronger
 
 
 def test_one_price_down_lock_defers_sell_then_retries_next_day() -> None:

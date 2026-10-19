@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import math
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from statistics import fmean, stdev
 
 from sequoia_x.backtest.models import (
+    AnnualReturn,
     BacktestConfig,
+    ClosedTrade,
     EquityPoint,
     OpenPosition,
     OrderRecord,
@@ -41,17 +43,19 @@ class PortfolioSimulator:
         signal_dates: tuple[str, ...],
         signals: tuple[SignalRecord, ...],
         snapshot_source: Callable[[str], ResearchSnapshot],
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> tuple[PortfolioResult, ...]:
         instrument_ids = {signal.instrument_id for signal in signals}
         market_bars: dict[str, dict[str, ResearchBar]] = {}
-        for day in dates:
+        for index, day in enumerate(dates, 1):
             snapshot = snapshot_source(day)
             market_bars[day] = {
                 instrument_id: bars[-1]
                 for instrument_id in instrument_ids
-                if (bars := snapshot.bars.get(instrument_id))
-                and bars[-1].trade_date == day
+                if (bars := snapshot.bars.get(instrument_id)) and bars[-1].trade_date == day
             }
+            if progress_callback:
+                progress_callback(index, len(dates), day)
         results = []
         for strategy_key in config.strategy_keys:
             strategy_signals = tuple(
@@ -99,7 +103,12 @@ class PortfolioSimulator:
                 if reason:
                     orders.append(
                         self._unfilled_order(
-                            position, strategy_key, day, "SELL", "DEFERRED", reason
+                            position,
+                            strategy_key,
+                            day,
+                            "SELL",
+                            "DEFERRED",
+                            reason,
                         )
                     )
                     continue
@@ -130,20 +139,20 @@ class PortfolioSimulator:
 
             previous_day = dates[index - 1] if index else None
             entry_signals = (
-                signal_map.get(previous_day, [])
-                if previous_day in signal_date_set
-                else []
+                signal_map.get(previous_day, []) if previous_day in signal_date_set else []
             )
-            for signal in sorted(entry_signals, key=lambda item: item.instrument_id):
+            for signal in sorted(
+                entry_signals,
+                key=lambda item: (
+                    -(item.candidate_score if item.candidate_score is not None else 0.0),
+                    item.instrument_id,
+                ),
+            ):
                 if signal.instrument_id in positions:
-                    orders.append(
-                        self._rejected_buy(signal, strategy_key, day, "ALREADY_HELD")
-                    )
+                    orders.append(self._rejected_buy(signal, strategy_key, day, "ALREADY_HELD"))
                     continue
                 if len(positions) >= config.max_positions:
-                    orders.append(
-                        self._rejected_buy(signal, strategy_key, day, "MAX_POSITIONS")
-                    )
+                    orders.append(self._rejected_buy(signal, strategy_key, day, "MAX_POSITIONS"))
                     continue
                 bar = day_bars.get(signal.instrument_id)
                 reason = self._buy_block_reason(bar)
@@ -314,14 +323,22 @@ class PortfolioSimulator:
         total_return = equities[-1] / config.initial_cash - 1 if equities else 0.0
         periods = max(len(equities) - 1, 0)
         annualized_return = (
-            (1 + total_return) ** (252 / periods) - 1
-            if periods and 1 + total_return > 0
-            else None
+            (1 + total_return) ** (252 / periods) - 1 if periods and 1 + total_return > 0 else None
         )
         volatility = stdev(daily_returns) * math.sqrt(252) if len(daily_returns) > 1 else None
         sharpe = (
             fmean(daily_returns) / stdev(daily_returns) * math.sqrt(252)
             if len(daily_returns) > 1 and stdev(daily_returns) > 0
+            else None
+        )
+        downside_deviation = (
+            math.sqrt(fmean(min(value, 0.0) ** 2 for value in daily_returns))
+            if daily_returns
+            else 0.0
+        )
+        sortino = (
+            fmean(daily_returns) / downside_deviation * math.sqrt(252)
+            if downside_deviation > 0
             else None
         )
         peak = 0.0
@@ -330,6 +347,26 @@ class PortfolioSimulator:
             peak = max(peak, equity)
             if peak > 0:
                 max_drawdown = max(max_drawdown, 1 - equity / peak)
+        annual_returns = self._annual_returns(curve, config.initial_cash)
+        closed_trades = self._closed_trades(orders, curve)
+        profits = [trade.net_profit for trade in closed_trades if trade.net_profit > 0]
+        losses = [trade.net_profit for trade in closed_trades if trade.net_profit < 0]
+        trade_win_rate = len(profits) / len(closed_trades) if closed_trades else None
+        average_win = fmean(profits) if profits else None
+        average_loss = fmean(losses) if losses else None
+        profit_loss_ratio = (
+            average_win / abs(average_loss)
+            if average_win is not None and average_loss is not None
+            else None
+        )
+        average_equity = fmean(equities) if equities else 0.0
+        traded_notional = sum(item.notional for item in orders if item.status == "FILLED")
+        interval_turnover = traded_notional / average_equity if average_equity > 0 else None
+        annualized_turnover = (
+            interval_turnover * 252 / periods
+            if interval_turnover is not None and periods > 0
+            else None
+        )
         return PortfolioResult(
             strategy_key=strategy_key,
             initial_cash=config.initial_cash,
@@ -338,7 +375,16 @@ class PortfolioSimulator:
             annualized_return=annualized_return,
             annualized_volatility=volatility,
             sharpe_ratio=sharpe,
+            sortino_ratio=sortino,
             max_drawdown=max_drawdown,
+            annual_returns=annual_returns,
+            closed_trades=closed_trades,
+            trade_win_rate=trade_win_rate,
+            average_win=average_win,
+            average_loss=average_loss,
+            profit_loss_ratio=profit_loss_ratio,
+            interval_turnover=interval_turnover,
+            annualized_turnover=annualized_turnover,
             filled_buys=sum(item.side == "BUY" and item.status == "FILLED" for item in orders),
             filled_sells=sum(item.side == "SELL" and item.status == "FILLED" for item in orders),
             rejected_orders=sum(item.status == "REJECTED" for item in orders),
@@ -359,3 +405,61 @@ class PortfolioSimulator:
                 for item in sorted(positions.values(), key=lambda value: value.instrument_id)
             ),
         )
+
+    @staticmethod
+    def _annual_returns(
+        curve: list[EquityPoint], initial_equity: float
+    ) -> tuple[AnnualReturn, ...]:
+        grouped: dict[int, list[EquityPoint]] = defaultdict(list)
+        for point in curve:
+            grouped[int(point.trade_date[:4])].append(point)
+        output = []
+        opening_equity = initial_equity
+        for year, points in sorted(grouped.items()):
+            first, last = points[0], points[-1]
+            output.append(
+                AnnualReturn(
+                    year=year,
+                    return_rate=(last.total_equity / opening_equity - 1),
+                    is_partial=not (first.trade_date[5:7] == "01" and last.trade_date[5:7] == "12"),
+                )
+            )
+            opening_equity = last.total_equity
+        return tuple(output)
+
+    @staticmethod
+    def _closed_trades(
+        orders: list[OrderRecord], curve: list[EquityPoint]
+    ) -> tuple[ClosedTrade, ...]:
+        buys: dict[str, deque[OrderRecord]] = defaultdict(deque)
+        date_indexes = {point.trade_date: index for index, point in enumerate(curve)}
+        output = []
+        for order in orders:
+            if order.status != "FILLED":
+                continue
+            if order.side == "BUY":
+                buys[order.instrument_id].append(order)
+                continue
+            if order.side != "SELL" or not buys[order.instrument_id]:
+                continue
+            buy = buys[order.instrument_id].popleft()
+            entry_cost = buy.notional + buy.commission + buy.stamp_duty
+            exit_proceeds = order.notional - order.commission - order.stamp_duty
+            net_profit = exit_proceeds - entry_cost
+            output.append(
+                ClosedTrade(
+                    instrument_id=order.instrument_id,
+                    entry_date=buy.trade_date,
+                    exit_date=order.trade_date,
+                    quantity=order.quantity,
+                    entry_price=buy.price or 0.0,
+                    exit_price=order.price or 0.0,
+                    holding_days=max(
+                        date_indexes.get(order.trade_date, 0) - date_indexes.get(buy.trade_date, 0),
+                        0,
+                    ),
+                    net_profit=net_profit,
+                    return_rate=net_profit / entry_cost if entry_cost > 0 else 0.0,
+                )
+            )
+        return tuple(output)

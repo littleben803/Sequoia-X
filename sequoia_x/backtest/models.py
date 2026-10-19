@@ -23,6 +23,7 @@ class BacktestConfig:
     commission_rate: float = 0.0003
     minimum_commission: float = 5.0
     slippage_bps: float = 0.0
+    benchmark_ids: tuple[str, ...] = ("SSE:000300", "SSE:000985")
 
     def __post_init__(self) -> None:
         start = date.fromisoformat(self.start_date)
@@ -51,6 +52,22 @@ class BacktestConfig:
             raise ValueError("佣金参数不能为负数")
         if self.slippage_bps < 0:
             raise ValueError("滑点不能为负数")
+        if len(set(self.benchmark_ids)) != len(self.benchmark_ids):
+            raise ValueError("基准证券不能重复")
+
+
+@dataclass(frozen=True)
+class BacktestProgress:
+    """回测运行的结构化进度事件。"""
+
+    phase: str
+    message: str
+    step: int
+    total_steps: int = 6
+    completed: int = 0
+    total: int = 1
+    signals: int = 0
+    outcomes: int = 0
 
 
 @dataclass(frozen=True)
@@ -62,6 +79,7 @@ class SignalRecord:
     rule_basis: tuple[str, ...]
     risk_note: str | None
     snapshot_coverage: float
+    candidate_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +104,7 @@ class BacktestResult:
     snapshot_coverages: tuple[tuple[str, float], ...]
     calculation_errors: tuple[str, ...]
     portfolios: tuple[PortfolioResult, ...] = ()
+    benchmarks: tuple[BenchmarkResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -124,6 +143,38 @@ class OpenPosition:
 
 
 @dataclass(frozen=True)
+class ClosedTrade:
+    instrument_id: str
+    entry_date: str
+    exit_date: str
+    quantity: int
+    entry_price: float
+    exit_price: float
+    holding_days: int
+    net_profit: float
+    return_rate: float
+
+
+@dataclass(frozen=True)
+class AnnualReturn:
+    year: int
+    return_rate: float
+    is_partial: bool
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    instrument_id: str
+    name: str
+    start_date: str
+    end_date: str
+    total_return: float
+    annualized_return: float | None
+    max_drawdown: float
+    annual_returns: tuple[AnnualReturn, ...]
+
+
+@dataclass(frozen=True)
 class PortfolioResult:
     strategy_key: str
     initial_cash: float
@@ -132,7 +183,16 @@ class PortfolioResult:
     annualized_return: float | None
     annualized_volatility: float | None
     sharpe_ratio: float | None
+    sortino_ratio: float | None
     max_drawdown: float
+    annual_returns: tuple[AnnualReturn, ...]
+    closed_trades: tuple[ClosedTrade, ...]
+    trade_win_rate: float | None
+    average_win: float | None
+    average_loss: float | None
+    profit_loss_ratio: float | None
+    interval_turnover: float | None
+    annualized_turnover: float | None
     filled_buys: int
     filled_sells: int
     rejected_orders: int
@@ -142,4 +202,3 @@ class PortfolioResult:
     orders: tuple[OrderRecord, ...]
     equity_curve: tuple[EquityPoint, ...]
     open_positions: tuple[OpenPosition, ...]
-

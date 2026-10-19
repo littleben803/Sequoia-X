@@ -6,6 +6,7 @@ from pathlib import Path
 from sequoia_x.data.database import MarketDataRepository
 from sequoia_x.data.models import (
     Adjustment,
+    BenchmarkBarsResult,
     DailyBar,
     DailySnapshotResult,
     DailyStatus,
@@ -77,6 +78,58 @@ def test_snapshot_keeps_all_security_types_and_raw_payload(tmp_path: Path) -> No
     assert kinds == {"BOND": 1, "ETF": 1, "STOCK": 1}
     assert len(payloads) == 3
     assert all('"untouched": "payload"' in payload for payload in payloads)
+
+
+def test_benchmark_bars_are_auditable_and_do_not_create_daily_snapshot(tmp_path: Path) -> None:
+    repository = MarketDataRepository(str(tmp_path / "v3.db"))
+    instrument = InstrumentRecord(
+        exchange=Exchange.SSE,
+        security_code="000985",
+        name="中证全指",
+        security_type=SecurityType.INDEX,
+        source="tencent",
+        source_identifier="sh000985",
+    )
+    bar = DailyBar(
+        instrument_id=instrument.instrument_id,
+        trade_date="2026-10-13",
+        open=6000,
+        high=6100,
+        low=5900,
+        close=6050,
+        previous_close=5950,
+        volume=100,
+        amount=0,
+        provider="tencent",
+        raw_payload={"amount_unavailable": True},
+    )
+    result = BenchmarkBarsResult(
+        instrument=instrument,
+        start_date="2026-10-13",
+        end_date="2026-10-13",
+        provider="tencent",
+        source_url="https://example.test/kline",
+        bars=(bar,),
+        checksum="abc",
+    )
+    batch_id = repository.start_batch("tencent", "BENCHMARK_BARS", "2026-10-13")
+
+    assert repository.save_benchmark_bars(batch_id, result) == (1, 0)
+
+    with repository.connect() as conn:
+        raw = conn.execute("SELECT provider, raw_payload_json FROM daily_bars_raw").fetchone()
+        canonical = conn.execute(
+            "SELECT close, selected_provider, quality_status FROM daily_bars_canonical"
+        ).fetchone()
+    assert raw[0] == "tencent"
+    assert '"amount_unavailable": true' in raw[1]
+    assert canonical == (6050.0, "tencent", "BENCHMARK_RAW")
+    assert repository.has_complete_snapshot("2026-10-13") is False
+
+    second_batch = repository.start_batch("tencent", "BENCHMARK_BARS", "2026-10-13")
+    assert repository.save_benchmark_bars(second_batch, result) == (0, 1)
+    with repository.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM daily_bars_raw").fetchone()[0] == 1
 
 
 def test_snapshot_reports_throttled_instrument_and_bar_write_progress(tmp_path: Path) -> None:

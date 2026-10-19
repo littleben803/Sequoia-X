@@ -78,15 +78,172 @@ def _snapshot(bars: dict[str, tuple[ResearchBar, ...]]) -> ResearchSnapshot:
     )
 
 
-def test_ma_volume_preserves_golden_cross_and_volume_formula() -> None:
-    closes = [10.0] * 16 + [8.0] * 4 + [20.0]
-    volumes = [100.0] * 20 + [1_000.0]
-    snapshot = _snapshot({"SSE:600001": _bars(closes, volumes=volumes)})
+def _ma_volume_closes() -> list[float]:
+    warmup = [7.0 + index * (2.9 / 59) for index in range(60)]
+    signal_window = [
+        10.0,
+        9.9219,
+        9.9563,
+        10.0368,
+        10.1094,
+        10.0917,
+        10.0934,
+        10.1161,
+        10.2208,
+        10.2477,
+        10.2354,
+        10.2527,
+        10.1285,
+        10.01,
+        10.0911,
+        10.2576,
+        10.3068,
+        10.2945,
+        10.2133,
+        10.2344,
+        10.4029,
+        10.5081,
+        10.5416,
+        10.6766,
+        10.6122,
+        10.6378,
+        10.8035,
+        10.8503,
+        10.8587,
+        10.8053,
+        10.8424,
+        11.0128,
+        10.8715,
+        10.9858,
+        11.1134,
+        11.2644,
+        11.3682,
+        11.4963,
+        11.5258,
+        11.57,
+        11.5675,
+        11.4366,
+        11.5864,
+        11.6339,
+        11.5524,
+        11.5772,
+        11.5951,
+        11.5685,
+        11.5382,
+        11.5746,
+        11.6406,
+        11.6683,
+        11.6419,
+        11.4654,
+        11.361,
+        11.2396,
+        11.2568,
+        11.3675,
+        11.4579,
+        11.5486,
+        12.2192,
+    ]
+    return warmup + signal_window
+
+
+def _ma_volume_bars(
+    *,
+    instrument_id: str,
+    current_volume: float = 200.0,
+    average_amount: float = 100_000_000.0,
+) -> tuple[ResearchBar, ...]:
+    closes = _ma_volume_closes()
+    opens = closes.copy()
+    opens[-1] = closes[-2]
+    return _bars(
+        closes,
+        opens=opens,
+        volumes=[100.0] * 120 + [current_volume],
+        amounts=[average_amount] * 121,
+        instrument_id=instrument_id,
+    )
+
+
+def test_ma_volume_requires_trend_liquidity_and_independent_volume_baseline() -> None:
+    qualified = "SZSE:000001"
+    low_liquidity = "SSE:600001"
+    snapshot = _snapshot(
+        {
+            qualified: _ma_volume_bars(instrument_id=qualified),
+            low_liquidity: _ma_volume_bars(
+                instrument_id=low_liquidity,
+                average_amount=49_999_999.0,
+            ),
+        }
+    )
 
     result = MaVolumeStrategy().run(snapshot)
 
-    assert result.selected_instruments == ("SSE:600001",)
+    assert result.selected_instruments == (qualified,)
     assert result.as_of_date == snapshot.as_of_date
+    assert 0 <= dict(result.candidate_scores)[qualified] <= 100
+
+
+def test_ma_volume_ranks_stronger_candidate_before_instrument_code() -> None:
+    weaker = "SSE:600001"
+    stronger = "SZSE:000001"
+    snapshot = _snapshot(
+        {
+            weaker: _ma_volume_bars(instrument_id=weaker, current_volume=180.0),
+            stronger: _ma_volume_bars(instrument_id=stronger, current_volume=300.0),
+        }
+    )
+
+    result = MaVolumeStrategy().run(snapshot)
+
+    assert result.selected_instruments == (stronger, weaker)
+    assert result.candidate_scores[0][1] > result.candidate_scores[1][1]
+
+
+def test_ma_volume_rejects_single_candle_abnormality() -> None:
+    instrument_id = "SSE:600001"
+    normal = list(_ma_volume_bars(instrument_id=instrument_id))
+    current = normal[-1]
+    normal[-1] = ResearchBar(
+        instrument_id=current.instrument_id,
+        trade_date=current.trade_date,
+        open=current.open,
+        high=current.high * 1.08,
+        low=current.low * 0.96,
+        close=current.close,
+        previous_close=current.previous_close,
+        volume=current.volume,
+        amount=current.amount,
+        adjustment_factor=current.adjustment_factor,
+    )
+
+    result = MaVolumeStrategy().run(_snapshot({instrument_id: tuple(normal)}))
+
+    assert result.selected_instruments == ()
+
+
+def test_ma_volume_requires_ma60_to_be_rising() -> None:
+    instrument_id = "SSE:600001"
+    bars = list(_ma_volume_bars(instrument_id=instrument_id))
+    for index in range(51, 61):
+        bar = bars[index]
+        price = 18.0
+        bars[index] = ResearchBar(
+            instrument_id=bar.instrument_id,
+            trade_date=bar.trade_date,
+            open=price,
+            high=price * 1.01,
+            low=price * 0.99,
+            close=price,
+            previous_close=bars[index - 1].close if index else None,
+            volume=bar.volume,
+            amount=bar.amount,
+            adjustment_factor=bar.adjustment_factor,
+        )
+
+    result = MaVolumeStrategy().run(_snapshot({instrument_id: tuple(bars)}))
+
+    assert result.selected_instruments == ()
 
 
 def test_turtle_preserves_breakout_liquidity_and_candle_formula() -> None:

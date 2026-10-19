@@ -16,6 +16,8 @@ from sequoia_x.data.research import (
 from sequoia_x.reporting.console import (
     AdjustmentFactorConsole,
     BackfillConsole,
+    BacktestAuditConsole,
+    BacktestRunConsole,
     DataConsole,
     ResearchScanConsole,
 )
@@ -47,6 +49,147 @@ def test_backfill_summary_distinguishes_aborted_run() -> None:
     assert "提前终止" in rendered
     assert "25.00%" in rendered
     assert "数据服务重连失败" in rendered
+
+
+def test_backtest_audit_summary_is_compact_and_human_readable() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=120)
+    view = BacktestAuditConsole(console)
+    view.show_summary(
+        {
+            "ready": True,
+            "start_date": "2025-01-01",
+            "end_date": "2025-03-31",
+            "complete_trading_days": 57,
+            "first_complete_date": "2025-01-02",
+            "last_complete_date": "2025-03-31",
+            "boundary_audits": [
+                {
+                    "as_of_date": "2025-01-02",
+                    "requested_instruments": 4541,
+                    "eligible_instruments": 4479,
+                    "coverage": 0.9863,
+                    "exclusion_counts": {
+                        "MISSING_QFQ_FACTORS": 49,
+                        "NO_BAR_ON_RESEARCH_DATE": 13,
+                    },
+                },
+                {
+                    "as_of_date": "2025-03-31",
+                    "requested_instruments": 4580,
+                    "eligible_instruments": 4530,
+                    "coverage": 0.9891,
+                    "exclusion_counts": {"NO_BAR_ON_RESEARCH_DATE": 50},
+                },
+            ],
+            "problems": [],
+            "elapsed_seconds": 82.4,
+        }
+    )
+
+    rendered = output.getvalue()
+    assert "Backtest Audit Summary" in rendered
+    assert "可以开始回测" in rendered
+    assert "57 天" in rendered
+    assert "98.63%" in rendered
+    assert "缺少前复权因子 49" in rendered
+    assert "82.4 秒" in rendered
+
+
+def test_backtest_run_summary_explains_signal_and_portfolio_results() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=140)
+    view = BacktestRunConsole(console)
+    config = SimpleNamespace(
+        start_date="2025-01-01",
+        end_date="2025-03-31",
+        strategy_keys=("ma_volume",),
+        horizons=(1, 5),
+        initial_cash=1_000_000.0,
+    )
+    outcomes = (
+        SimpleNamespace(strategy_key="ma_volume", horizon=1, return_rate=0.02),
+        SimpleNamespace(strategy_key="ma_volume", horizon=1, return_rate=-0.01),
+        SimpleNamespace(strategy_key="ma_volume", horizon=5, return_rate=0.05),
+        SimpleNamespace(strategy_key="ma_volume", horizon=5, return_rate=None),
+    )
+    portfolio = SimpleNamespace(
+        strategy_key="ma_volume",
+        initial_cash=1_000_000.0,
+        final_equity=769_298.76,
+        total_return=-0.23070124,
+        annualized_return=-0.62,
+        annualized_volatility=0.25,
+        sharpe_ratio=-2.1,
+        sortino_ratio=-2.8,
+        max_drawdown=0.23070124,
+        annual_returns=(SimpleNamespace(year=2025, return_rate=-0.23070124, is_partial=True),),
+        closed_trades=tuple(range(119)),
+        trade_win_rate=0.40,
+        average_win=1_000.0,
+        average_loss=-1_500.0,
+        profit_loss_ratio=2 / 3,
+        interval_turnover=20.0,
+        annualized_turnover=80.0,
+        filled_buys=119,
+        filled_sells=119,
+        rejected_orders=2060,
+        deferred_orders=0,
+        total_commission=800.0,
+        total_stamp_duty=600.0,
+        open_positions=(),
+        orders=(
+            SimpleNamespace(status="REJECTED", reason="MAX_POSITIONS"),
+            SimpleNamespace(status="REJECTED", reason="MAX_POSITIONS"),
+        ),
+    )
+    result = SimpleNamespace(
+        config=config,
+        signal_dates=tuple(str(index) for index in range(57)),
+        signals=tuple(range(2179)),
+        outcomes=outcomes,
+        snapshot_coverages=(("2025-01-02", 0.9863), ("2025-03-31", 0.9892)),
+        calculation_errors=(),
+        portfolios=(portfolio,),
+        benchmarks=(
+            SimpleNamespace(
+                instrument_id="SSE:000300",
+                name="沪深300",
+                total_return=0.05,
+                annualized_return=0.22,
+                annual_returns=(SimpleNamespace(year=2025, return_rate=0.05, is_partial=True),),
+            ),
+            SimpleNamespace(
+                instrument_id="SSE:000985",
+                name="中证全指",
+                total_return=0.08,
+                annualized_return=0.30,
+                annual_returns=(SimpleNamespace(year=2025, return_rate=0.08, is_partial=True),),
+            ),
+        ),
+    )
+
+    view.show_summary(
+        result=result,
+        report_path=Path("reports/test.json"),
+        elapsed_seconds=120.5,
+    )
+
+    rendered = output.getvalue()
+    assert "回测概览" in rendered
+    assert "信号表现" in rendered
+    assert "平均涨跌" in rendered
+    assert "模拟账户：ma_volume" in rendered
+    assert "-¥230,701.24（-23.07%）" in rendered
+    assert "最大回撤" in rendered
+    assert "Sortino" in rendered
+    assert "胜率" in rendered
+    assert "年度表现与基准" in rendered
+    assert "沪深300" in rendered
+    assert "中证全指" in rendered
+    assert "仓位已满 2" in rendered
+    assert "区间较短" in rendered
+    assert "信号收益回答" in rendered
 
 
 def test_progress_displays_stock_name_and_code() -> None:
